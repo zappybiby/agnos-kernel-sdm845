@@ -43,9 +43,13 @@
 static struct kset *iommu_group_kset;
 static DEFINE_IDA(iommu_group_ida);
 
-#define IOMMU_DIAG_HISTORY_SIZE	256
+#define IOMMU_DIAG_HISTORY_SIZE	1024
 #define IOMMU_DIAG_NAME_LEN	48
 #define IOMMU_DIAG_DUMP_LIMIT	24
+#define IOMMU_DIAG_EXACT_LIMIT	16
+#define IOMMU_DIAG_NEAR_LIMIT	16
+#define IOMMU_DIAG_CONTEXT_LIMIT 16
+#define IOMMU_DIAG_NEAR_WINDOW	(64 * 1024)
 
 struct iommu_diag_entry {
 	u64 seq;
@@ -116,6 +120,49 @@ static bool iommu_diag_overlap(const struct iommu_diag_entry *entry,
 	return fault_iova >= entry->iova && fault_iova <= end;
 }
 
+static bool iommu_diag_same_page(const struct iommu_diag_entry *entry,
+				 unsigned long fault_iova)
+{
+	unsigned long fault_page = fault_iova & PAGE_MASK;
+	unsigned long start_page, end;
+
+	if (!entry->size)
+		return false;
+
+	start_page = entry->iova & PAGE_MASK;
+	end = entry->iova + entry->size - 1;
+	if (end < entry->iova)
+		end = ~0UL;
+
+	return fault_page >= start_page && fault_page <= (end & PAGE_MASK);
+}
+
+static bool iommu_diag_near(const struct iommu_diag_entry *entry,
+			    unsigned long fault_iova)
+{
+	unsigned long entry_end;
+	unsigned long gap;
+
+	if (!entry->size)
+		return false;
+
+	entry_end = entry->iova + entry->size - 1;
+	if (entry_end < entry->iova)
+		entry_end = ~0UL;
+
+	if (iommu_diag_overlap(entry, fault_iova))
+		return false;
+
+	if (fault_iova < entry->iova)
+		gap = entry->iova - fault_iova;
+	else if (fault_iova > entry_end)
+		gap = fault_iova - entry_end;
+	else
+		gap = 0;
+
+	return gap <= IOMMU_DIAG_NEAR_WINDOW;
+}
+
 void iommu_diag_record(enum iommu_diag_event event,
 		       struct iommu_domain *domain,
 		       struct device *dev,
@@ -178,7 +225,8 @@ void iommu_diag_dump_for_fault(struct device *fault_dev,
 {
 	struct iommu_diag_entry entry;
 	u64 end_seq, start_seq, seq;
-	int overlap_hits = 0, context_hits = 0;
+	int exact_hits = 0, near_hits = 0, context_hits = 0;
+	int same_page_hits = 0;
 
 	spin_lock_irq(&iommu_diag_lock);
 	end_seq = iommu_diag_seq;
@@ -186,12 +234,14 @@ void iommu_diag_dump_for_fault(struct device *fault_dev,
 		end_seq - IOMMU_DIAG_HISTORY_SIZE + 1 : 1;
 	spin_unlock_irq(&iommu_diag_lock);
 
-	pr_err("Recent IOMMU history for iova=0x%lx domain=%s dev=%s\n",
-	       iova, domain ? domain->name : "<none>",
-	       fault_dev ? dev_name(fault_dev) : "<none>");
+	pr_err("Recent IOMMU history for iova=0x%lx page=0x%lx domain=%s dev=%s window=%u entries\n",
+	       iova, iova & PAGE_MASK,
+	       domain ? domain->name : "<none>",
+	       fault_dev ? dev_name(fault_dev) : "<none>",
+	       (unsigned int)(end_seq - start_seq + 1));
 
-	for (seq = start_seq; seq <= end_seq; seq++) {
-		bool overlap, same_domain, same_dev;
+	for (seq = end_seq; seq >= start_seq; seq--) {
+		bool overlap, same_domain, same_dev, same_page, near;
 		unsigned long flags;
 
 		spin_lock_irqsave(&iommu_diag_lock, flags);
@@ -202,23 +252,74 @@ void iommu_diag_dump_for_fault(struct device *fault_dev,
 			continue;
 
 		overlap = iommu_diag_overlap(&entry, iova);
+		same_page = iommu_diag_same_page(&entry, iova);
+		near = iommu_diag_near(&entry, iova);
 		same_domain = domain && entry.domain == domain;
 		same_dev = fault_dev && entry.dev == fault_dev;
-		if (!overlap && !same_domain && !same_dev)
-			continue;
-		if (!overlap && context_hits >= IOMMU_DIAG_DUMP_LIMIT)
+		if (!overlap && !same_page && !near && !same_domain && !same_dev)
 			continue;
 
-		iommu_diag_dump_entry(&entry, overlap);
-		if (overlap)
-			overlap_hits++;
-		else
+		if (overlap) {
+			if (exact_hits >= IOMMU_DIAG_EXACT_LIMIT)
+				continue;
+			iommu_diag_dump_entry(&entry, true);
+			exact_hits++;
+			continue;
+		}
+
+		if (same_page) {
+			if (same_page_hits >= IOMMU_DIAG_EXACT_LIMIT)
+				continue;
+			pr_err("diag[%llu] same_page ts=%lluns cpu=%d pid=%d comm=%s event=%s domain=%s dev=%s iova=0x%lx size=0x%zx paddr=%pa prot=0x%x aux0=0x%lx aux1=0x%lx caller=%pS\n",
+			       entry.seq, entry.ts_ns, entry.cpu, entry.pid,
+			       entry.comm, iommu_diag_event_str(entry.event),
+			       entry.domain_name[0] ? entry.domain_name : "<none>",
+			       entry.dev_name[0] ? entry.dev_name : "<none>",
+			       entry.iova, entry.size, &entry.paddr, entry.prot,
+			       entry.aux0, entry.aux1, (void *)entry.caller);
+			same_page_hits++;
+			continue;
+		}
+
+		if (near && (same_domain || same_dev)) {
+			if (near_hits >= IOMMU_DIAG_NEAR_LIMIT)
+				continue;
+			pr_err("diag[%llu] near ts=%lluns cpu=%d pid=%d comm=%s event=%s domain=%s dev=%s iova=0x%lx size=0x%zx paddr=%pa prot=0x%x aux0=0x%lx aux1=0x%lx caller=%pS\n",
+			       entry.seq, entry.ts_ns, entry.cpu, entry.pid,
+			       entry.comm, iommu_diag_event_str(entry.event),
+			       entry.domain_name[0] ? entry.domain_name : "<none>",
+			       entry.dev_name[0] ? entry.dev_name : "<none>",
+			       entry.iova, entry.size, &entry.paddr, entry.prot,
+			       entry.aux0, entry.aux1, (void *)entry.caller);
+			near_hits++;
+			continue;
+		}
+
+		if (context_hits < IOMMU_DIAG_CONTEXT_LIMIT) {
+			pr_err("diag[%llu] ctx ts=%lluns cpu=%d pid=%d comm=%s event=%s domain=%s dev=%s iova=0x%lx size=0x%zx paddr=%pa prot=0x%x aux0=0x%lx aux1=0x%lx caller=%pS\n",
+			       entry.seq, entry.ts_ns, entry.cpu, entry.pid,
+			       entry.comm, iommu_diag_event_str(entry.event),
+			       entry.domain_name[0] ? entry.domain_name : "<none>",
+			       entry.dev_name[0] ? entry.dev_name : "<none>",
+			       entry.iova, entry.size, &entry.paddr, entry.prot,
+			       entry.aux0, entry.aux1, (void *)entry.caller);
 			context_hits++;
+		}
+
+		if ((exact_hits + same_page_hits + near_hits + context_hits) >=
+		    IOMMU_DIAG_DUMP_LIMIT)
+			break;
 	}
 
-	if (!overlap_hits) {
-		pr_err("No recent history overlapped iova=0x%lx; this suggests never-valid, aged-out history, or reuse outside the captured window\n",
-		       iova);
+	if (!exact_hits && !same_page_hits) {
+		pr_err("No recent history hit iova=0x%lx/page=0x%lx; likely never-valid, history aged out, or reuse occurred outside the captured window\n",
+		       iova, iova & PAGE_MASK);
+	}
+	if (!near_hits && !context_hits) {
+		pr_err("No recent nearby/context history matched domain=%s dev=%s within +/-0x%x\n",
+		       domain ? domain->name : "<none>",
+		       fault_dev ? dev_name(fault_dev) : "<none>",
+		       IOMMU_DIAG_NEAR_WINDOW);
 	}
 }
 EXPORT_SYMBOL_GPL(iommu_diag_dump_for_fault);

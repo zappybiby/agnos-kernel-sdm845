@@ -209,6 +209,11 @@ enum icnss_msa_perm {
 };
 
 #define ICNSS_MAX_VMIDS     4
+#define ICNSS_DIAG_ALLOC_MAX 512
+#define ICNSS_DIAG_DUMP_LIMIT 24
+#define ICNSS_DIAG_NEAR_WINDOW (64 * 1024)
+#define ICNSS_DIAG_WLAN_MAC_DUMP_COUNT 200
+#define ICNSS_DIAG_WLAN_DP_DUMP_COUNT 128
 
 struct icnss_mem_region_info {
 	uint64_t reg_addr;
@@ -222,6 +227,30 @@ struct icnss_msa_perm_list_t {
 	int perms[ICNSS_MAX_VMIDS];
 	int nelems;
 };
+
+struct icnss_diag_alloc {
+	u64 seq;
+	u64 ts_ns;
+	unsigned long iova;
+	unsigned long base_iova;
+	phys_addr_t paddr;
+	size_t size;
+	size_t len;
+	unsigned long caller;
+	pid_t pid;
+	int cpu;
+	char comm[TASK_COMM_LEN];
+};
+
+#if IS_REACHABLE(CONFIG_QCA_CLD_WLAN)
+extern void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
+				  const char *reason);
+#else
+static inline void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
+					 const char *reason)
+{
+}
+#endif
 
 struct icnss_msa_perm_list_t msa_perm_secure_list[ICNSS_MSA_PERM_MAX] = {
 	[ICNSS_MSA_PERM_HLOS_ALL] = {
@@ -422,13 +451,18 @@ static struct icnss_priv {
 	struct dma_iommu_mapping *smmu_mapping;
 	dma_addr_t smmu_iova_start;
 	size_t smmu_iova_len;
+	dma_addr_t smmu_iova_ipa_base;
 	dma_addr_t smmu_iova_ipa_start;
 	size_t smmu_iova_ipa_len;
+	spinlock_t smmu_diag_lock;
+	u64 smmu_diag_seq;
+	struct icnss_diag_alloc smmu_diag_allocs[ICNSS_DIAG_ALLOC_MAX];
 	struct qmi_handle *wlfw_clnt;
 	struct list_head event_list;
 	spinlock_t event_lock;
 	struct work_struct event_work;
 	struct work_struct qmi_recv_msg_work;
+	struct work_struct wlan_dump_work;
 	struct workqueue_struct *event_wq;
 	phys_addr_t msa_pa;
 	uint32_t msa_mem_size;
@@ -469,6 +503,8 @@ static struct icnss_priv {
 	bool force_err_fatal;
 	bool allow_recursive_recovery;
 	bool early_crash_ind;
+	atomic_t wlan_dump_queued;
+	const char *wlan_dump_reason;
 	u8 cause_for_rejuvenation;
 	u8 requesting_sub_system;
 	u16 line_number;
@@ -667,6 +703,160 @@ static void icnss_pm_relax(struct icnss_priv *priv)
 	pm_relax(&priv->pdev->dev);
 	priv->stats.pm_relax++;
 }
+
+static void icnss_diag_record_map(struct icnss_priv *priv, phys_addr_t paddr,
+				  unsigned long iova, size_t size, size_t len,
+				  unsigned long base_iova,
+				  unsigned long caller)
+{
+	struct icnss_diag_alloc *entry;
+	unsigned long flags;
+	u64 seq;
+
+	spin_lock_irqsave(&priv->smmu_diag_lock, flags);
+	seq = ++priv->smmu_diag_seq;
+	entry = &priv->smmu_diag_allocs[(seq - 1) % ICNSS_DIAG_ALLOC_MAX];
+	memset(entry, 0, sizeof(*entry));
+	entry->seq = seq;
+	entry->ts_ns = ktime_get_mono_fast_ns();
+	entry->iova = iova;
+	entry->base_iova = base_iova;
+	entry->paddr = paddr;
+	entry->size = size;
+	entry->len = len;
+	entry->caller = caller;
+	entry->pid = current->pid;
+	entry->cpu = raw_smp_processor_id();
+	strlcpy(entry->comm, current->comm, sizeof(entry->comm));
+	spin_unlock_irqrestore(&priv->smmu_diag_lock, flags);
+}
+
+static bool icnss_diag_iova_in_range(unsigned long iova, unsigned long start,
+				     size_t size)
+{
+	unsigned long end;
+
+	if (!size)
+		return false;
+
+	end = start + size - 1;
+	if (end < start)
+		end = ~0UL;
+
+	return iova >= start && iova <= end;
+}
+
+static void icnss_diag_dump_wlan_work_fn(struct work_struct *work)
+{
+	struct icnss_priv *priv = container_of(work, struct icnss_priv,
+					       wlan_dump_work);
+
+	icnss_pr_err("Dumping WLAN trace rings: reason=%s state=0x%lx force_err_fatal=%d early_crash_ind=%d\n",
+		     priv->wlan_dump_reason ? priv->wlan_dump_reason : "<none>",
+		     priv->state, priv->force_err_fatal, priv->early_crash_ind);
+
+	cds_dump_wlan_history(ICNSS_DIAG_WLAN_MAC_DUMP_COUNT,
+			      ICNSS_DIAG_WLAN_DP_DUMP_COUNT,
+			      priv->wlan_dump_reason);
+}
+
+void icnss_diag_queue_wlan_dump(struct device *dev, const char *reason)
+{
+	struct icnss_priv *priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return;
+
+	if (atomic_cmpxchg(&priv->wlan_dump_queued, 0, 1))
+		return;
+
+	priv->wlan_dump_reason = reason;
+
+	if (priv->event_wq)
+		queue_work(priv->event_wq, &priv->wlan_dump_work);
+	else
+		schedule_work(&priv->wlan_dump_work);
+}
+EXPORT_SYMBOL(icnss_diag_queue_wlan_dump);
+
+void icnss_diag_dump_iova(struct device *dev, unsigned long iova)
+{
+	struct icnss_priv *priv = dev_get_drvdata(dev);
+	u64 end_seq, start_seq, seq;
+	int hit_count = 0, near_count = 0;
+
+	if (!priv)
+		return;
+
+	icnss_pr_err("ICNSS IPA state for iova=0x%lx ipa_base=%pa ipa_cursor=%pa ipa_len=0x%zx\n",
+		     iova, &priv->smmu_iova_ipa_base, &priv->smmu_iova_ipa_start,
+		     priv->smmu_iova_ipa_len);
+	icnss_pr_err("ICNSS IPA classification: in_reserved=%d below_cursor=%d\n",
+		     icnss_diag_iova_in_range(iova, priv->smmu_iova_ipa_base,
+					      priv->smmu_iova_ipa_len),
+		     iova < priv->smmu_iova_ipa_start);
+
+	spin_lock_irq(&priv->smmu_diag_lock);
+	end_seq = priv->smmu_diag_seq;
+	start_seq = end_seq > ICNSS_DIAG_ALLOC_MAX ?
+		end_seq - ICNSS_DIAG_ALLOC_MAX + 1 : 1;
+	spin_unlock_irq(&priv->smmu_diag_lock);
+
+	for (seq = end_seq; seq >= start_seq; seq--) {
+		struct icnss_diag_alloc entry;
+		unsigned long flags;
+		unsigned long gap = 0;
+		unsigned long mapped_end;
+		bool hit;
+		bool near;
+
+		spin_lock_irqsave(&priv->smmu_diag_lock, flags);
+		entry = priv->smmu_diag_allocs[(seq - 1) % ICNSS_DIAG_ALLOC_MAX];
+		spin_unlock_irqrestore(&priv->smmu_diag_lock, flags);
+
+		if (entry.seq != seq)
+			continue;
+
+		hit = icnss_diag_iova_in_range(iova, entry.iova, entry.size) ||
+		      icnss_diag_iova_in_range(iova, entry.base_iova, entry.len);
+		mapped_end = entry.base_iova + entry.len - 1;
+		if (mapped_end < entry.base_iova)
+			mapped_end = ~0UL;
+
+		if (iova < entry.base_iova)
+			gap = entry.base_iova - iova;
+		else if (iova > mapped_end)
+			gap = iova - mapped_end;
+
+		near = !hit && gap <= ICNSS_DIAG_NEAR_WINDOW;
+		if (!hit && !near)
+			continue;
+
+		if (hit) {
+			icnss_pr_err("alloc[%llu] hit ts=%lluns cpu=%d pid=%d comm=%s iova=0x%lx base=0x%lx size=0x%zx len=0x%zx paddr=%pa caller=%pS\n",
+				     entry.seq, entry.ts_ns, entry.cpu, entry.pid,
+				     entry.comm, entry.iova, entry.base_iova,
+				     entry.size, entry.len, &entry.paddr,
+				     (void *)entry.caller);
+			hit_count++;
+		} else if (near_count < ICNSS_DIAG_DUMP_LIMIT) {
+			icnss_pr_err("alloc[%llu] near gap=0x%lx ts=%lluns cpu=%d pid=%d comm=%s iova=0x%lx base=0x%lx size=0x%zx len=0x%zx paddr=%pa caller=%pS\n",
+				     entry.seq, gap, entry.ts_ns, entry.cpu,
+				     entry.pid, entry.comm, entry.iova,
+				     entry.base_iova, entry.size, entry.len,
+				     &entry.paddr, (void *)entry.caller);
+			near_count++;
+		}
+
+		if ((hit_count + near_count) >= ICNSS_DIAG_DUMP_LIMIT)
+			break;
+	}
+
+	if (!hit_count)
+		icnss_pr_err("ICNSS IPA ledger found no handed-out allocation covering iova=0x%lx\n",
+			     iova);
+}
+EXPORT_SYMBOL(icnss_diag_dump_iova);
 
 static char *icnss_driver_event_to_str(enum icnss_driver_event_type type)
 {
@@ -1264,8 +1454,11 @@ static irqreturn_t fw_error_fatal_handler(int irq, void *ctx)
 {
 	struct icnss_priv *priv = ctx;
 
-	if (priv)
+	if (priv) {
 		priv->force_err_fatal = true;
+		icnss_diag_queue_wlan_dump(&priv->pdev->dev,
+					   "fw force error fatal irq");
+	}
 
 	icnss_pr_err("Received force error fatal request from FW\n");
 
@@ -3538,6 +3731,8 @@ int icnss_smmu_map(struct device *dev,
 
 	priv->smmu_iova_ipa_start = iova + len;
 	*iova_addr = (uint32_t)(iova + paddr - rounddown(paddr, PAGE_SIZE));
+	icnss_diag_record_map(priv, paddr, *iova_addr, size, len, iova,
+			      _RET_IP_);
 	iommu_diag_record(IOMMU_DIAG_ICNSS_MAP, priv->smmu_mapping->domain, dev,
 			  *iova_addr, paddr, size, IOMMU_READ | IOMMU_WRITE,
 			  len, iova, _RET_IP_);
@@ -3680,6 +3875,8 @@ static void icnss_smmu_deinit(struct icnss_priv *priv)
 	arm_iommu_release_mapping(priv->smmu_mapping);
 
 	priv->smmu_mapping = NULL;
+	priv->smmu_diag_seq = 0;
+	memset(priv->smmu_diag_allocs, 0, sizeof(priv->smmu_diag_allocs));
 }
 
 static int icnss_get_vreg_info(struct device *dev,
@@ -4695,6 +4892,7 @@ static int icnss_probe(struct platform_device *pdev)
 		if (!res) {
 			icnss_pr_err("SMMU IOVA IPA not found\n");
 		} else {
+			priv->smmu_iova_ipa_base = res->start;
 			priv->smmu_iova_ipa_start = res->start;
 			priv->smmu_iova_ipa_len = resource_size(res);
 			icnss_pr_dbg("SMMU IOVA IPA start: %pa, len: %zu\n",
@@ -4713,7 +4911,9 @@ static int icnss_probe(struct platform_device *pdev)
 
 	spin_lock_init(&priv->event_lock);
 	spin_lock_init(&priv->on_off_lock);
+	spin_lock_init(&priv->smmu_diag_lock);
 	mutex_init(&priv->dev_lock);
+	atomic_set(&priv->wlan_dump_queued, 0);
 
 	priv->event_wq = alloc_workqueue("icnss_driver_event", WQ_UNBOUND, 1);
 	if (!priv->event_wq) {
@@ -4724,6 +4924,7 @@ static int icnss_probe(struct platform_device *pdev)
 
 	INIT_WORK(&priv->event_work, icnss_driver_event_work);
 	INIT_WORK(&priv->qmi_recv_msg_work, icnss_qmi_wlfw_clnt_notify_work);
+	INIT_WORK(&priv->wlan_dump_work, icnss_diag_dump_wlan_work_fn);
 	INIT_LIST_HEAD(&priv->event_list);
 
 	ret = qmi_svc_event_notifier_register(WLFW_SERVICE_ID_V01,

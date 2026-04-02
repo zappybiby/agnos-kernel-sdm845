@@ -1214,6 +1214,22 @@ v_CONTEXT_t cds_get_global_context(void)
 	return gp_cds_context;
 } /* cds_get_global_context() */
 
+void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
+			   const char *reason)
+{
+	if (gp_cds_context == NULL) {
+		pr_err("%s: global cds context is NULL", __func__);
+		return;
+	}
+
+	QDF_TRACE(QDF_MODULE_ID_QDF, QDF_TRACE_LEVEL_INFO,
+		  "%s: dumping WLAN history reason=%s mac_count=%u dp_count=%u",
+		  __func__, reason ? reason : "<none>", mac_count, dp_count);
+
+	qdf_trace_dump_all(gp_cds_context->pMACContext, 0, 0, mac_count, 0);
+	qdf_dp_trace_dump_all(dp_count);
+}
+
 /**
  * cds_get_driver_state() - Get current driver state
  *

@@ -49,6 +49,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <soc/qcom/scm.h>
+#include <soc/qcom/icnss.h>
 #include <soc/qcom/secure_buffer.h>
 #include <linux/of_platform.h>
 #include <linux/msm-bus.h>
@@ -865,6 +866,8 @@ static void arm_smmu_dump_fault_context(struct iommu_domain *domain,
 
 	arm_smmu_dump_stream_mappings(smmu_domain, sid);
 	iommu_diag_dump_for_fault(smmu_domain->dev, domain, iova);
+	icnss_diag_dump_iova(smmu_domain->dev, iova);
+	icnss_diag_queue_wlan_dump(smmu_domain->dev, "arm-smmu context fault");
 }
 
 static void parse_driver_options(struct arm_smmu_device *smmu)

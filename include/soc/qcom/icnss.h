@@ -138,6 +138,8 @@ extern int icnss_power_off(struct device *dev);
 extern struct dma_iommu_mapping *icnss_smmu_get_mapping(struct device *dev);
 extern int icnss_smmu_map(struct device *dev, phys_addr_t paddr,
 			  uint32_t *iova_addr, size_t size);
+extern void icnss_diag_dump_iova(struct device *dev, unsigned long iova);
+extern void icnss_diag_queue_wlan_dump(struct device *dev, const char *reason);
 extern unsigned int icnss_socinfo_get_serial_number(struct device *dev);
 extern bool icnss_is_qmi_disable(struct device *dev);
 extern bool icnss_is_fw_ready(void);
