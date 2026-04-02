@@ -566,6 +566,7 @@ enum ftrace_dump_mode {
 void tracing_on(void);
 void tracing_off(void);
 int tracing_is_on(void);
+int tracing_alloc_snapshot(void);
 void tracing_snapshot(void);
 void tracing_snapshot_alloc(void);
 
@@ -713,6 +714,7 @@ static inline void trace_dump_stack(int skip) { }
 static inline void tracing_on(void) { }
 static inline void tracing_off(void) { }
 static inline int tracing_is_on(void) { return 0; }
+static inline int tracing_alloc_snapshot(void) { return 0; }
 static inline void tracing_snapshot(void) { }
 static inline void tracing_snapshot_alloc(void) { }
 

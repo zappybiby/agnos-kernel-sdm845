@@ -735,6 +735,11 @@ static void arm_smmu_fault_panic_work_fn(struct work_struct *work)
 			  "Panicking after deferred arm-smmu fault: cb=%u sid=0x%x iova=0x%08lx fsr=0x%x fsynr=0x%x\n",
 			  info.cbndx, info.sid, info.iova, info.fsr, info.fsynr);
 
+	if (info.smmu)
+		dev_emerg(info.smmu->dev,
+			  "Dumping active ftrace buffer to console for ramoops preservation before panic\n");
+	ftrace_dump(DUMP_ALL);
+
 	panic("Unhandled arm-smmu context fault");
 }
 
