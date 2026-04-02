@@ -168,7 +168,35 @@ struct iommu_dm_region {
 
 extern struct dentry *iommu_debugfs_top;
 
+enum iommu_diag_event {
+	IOMMU_DIAG_MAP,
+	IOMMU_DIAG_UNMAP,
+	IOMMU_DIAG_MAP_SG,
+	IOMMU_DIAG_ICNSS_MAP,
+	IOMMU_DIAG_ICNSS_MAP_FAIL,
+	IOMMU_DIAG_MSM_DMA_MAP,
+	IOMMU_DIAG_MSM_DMA_REUSE,
+	IOMMU_DIAG_MSM_DMA_MAP_FAIL,
+	IOMMU_DIAG_MSM_DMA_UNMAP_REQ,
+	IOMMU_DIAG_MSM_DMA_UNMAP_RELEASE,
+	IOMMU_DIAG_MSM_DMA_UNMAP_MISS,
+};
+
 #ifdef CONFIG_IOMMU_API
+
+void iommu_diag_record(enum iommu_diag_event event,
+		       struct iommu_domain *domain,
+		       struct device *dev,
+		       unsigned long iova,
+		       phys_addr_t paddr,
+		       size_t size,
+		       int prot,
+		       unsigned long aux0,
+		       unsigned long aux1,
+		       unsigned long caller);
+void iommu_diag_dump_for_fault(struct device *fault_dev,
+			       struct iommu_domain *domain,
+			       unsigned long iova);
 
 /**
  * struct iommu_ops - iommu ops and capabilities
@@ -406,6 +434,25 @@ int iommu_is_available(struct device *dev);
 struct iommu_ops {};
 struct iommu_group {};
 struct iommu_fwspec {};
+
+static inline void iommu_diag_record(enum iommu_diag_event event,
+				     struct iommu_domain *domain,
+				     struct device *dev,
+				     unsigned long iova,
+				     phys_addr_t paddr,
+				     size_t size,
+				     int prot,
+				     unsigned long aux0,
+				     unsigned long aux1,
+				     unsigned long caller)
+{
+}
+
+static inline void iommu_diag_dump_for_fault(struct device *fault_dev,
+					     struct iommu_domain *domain,
+					     unsigned long iova)
+{
+}
 
 static inline bool iommu_present(struct bus_type *bus)
 {

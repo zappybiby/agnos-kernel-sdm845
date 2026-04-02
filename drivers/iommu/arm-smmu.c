@@ -642,6 +642,7 @@ struct arm_smmu_fault_panic_info {
 static DEFINE_SPINLOCK(arm_smmu_fault_panic_lock);
 static atomic_t arm_smmu_fault_panic_queued = ATOMIC_INIT(0);
 static struct arm_smmu_fault_panic_info arm_smmu_fault_panic_info;
+static atomic_t arm_smmu_fault_snapshot_ready = ATOMIC_INIT(0);
 
 static const char *arm_smmu_domain_stage_str(enum arm_smmu_domain_stage stage)
 {
@@ -703,6 +704,23 @@ static const char *arm_smmu_s2cr_privcfg_str(enum arm_smmu_s2cr_privcfg privcfg)
 	}
 }
 
+static void arm_smmu_prepare_fault_snapshot(void)
+{
+	int ret;
+
+	if (atomic_read(&arm_smmu_fault_snapshot_ready))
+		return;
+
+	ret = tracing_alloc_snapshot();
+	if (ret < 0) {
+		pr_warn("Unable to preallocate ftrace snapshot buffer (%d)\n",
+			ret);
+		return;
+	}
+
+	atomic_set(&arm_smmu_fault_snapshot_ready, 1);
+}
+
 static void arm_smmu_fault_panic_work_fn(struct work_struct *work)
 {
 	struct arm_smmu_fault_panic_info info;
@@ -745,6 +763,15 @@ static void arm_smmu_schedule_fault_panic(struct arm_smmu_device *smmu,
 		.cbndx = cbndx,
 	};
 	spin_unlock_irqrestore(&arm_smmu_fault_panic_lock, flags);
+
+	if (atomic_read(&arm_smmu_fault_snapshot_ready)) {
+		tracing_snapshot();
+		dev_err(smmu->dev,
+			"Captured ftrace snapshot for arm-smmu fault; inspect /sys/kernel/debug/tracing/snapshot before panic\n");
+	} else {
+		dev_err(smmu->dev,
+			"ftrace snapshot buffer was not preallocated; skipping snapshot capture\n");
+	}
 
 	schedule_delayed_work(&arm_smmu_fault_panic_work,
 			      msecs_to_jiffies(fault_panic_delay_ms));
@@ -859,6 +886,7 @@ static void arm_smmu_dump_fault_context(struct iommu_domain *domain,
 		&phys_soft, &phys_atos, iova & 0xfff);
 
 	arm_smmu_dump_stream_mappings(smmu_domain, sid);
+	iommu_diag_dump_for_fault(smmu_domain->dev, domain, iova);
 }
 
 static void parse_driver_options(struct arm_smmu_device *smmu)
@@ -4985,6 +5013,7 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 
 	parse_driver_options(smmu);
 	parse_static_cb_cfg(smmu);
+	arm_smmu_prepare_fault_snapshot();
 
 	smmu->pwr = arm_smmu_init_power_resources(pdev);
 	if (IS_ERR(smmu->pwr))

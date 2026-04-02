@@ -33,12 +33,195 @@
 #include <linux/bitops.h>
 #include <linux/debugfs.h>
 #include <linux/property.h>
+#include <linux/sched.h>
+#include <linux/spinlock.h>
+#include <linux/timekeeping.h>
 #include <trace/events/iommu.h>
 
 #include "iommu-debug.h"
 
 static struct kset *iommu_group_kset;
 static DEFINE_IDA(iommu_group_ida);
+
+#define IOMMU_DIAG_HISTORY_SIZE	256
+#define IOMMU_DIAG_NAME_LEN	48
+#define IOMMU_DIAG_DUMP_LIMIT	24
+
+struct iommu_diag_entry {
+	u64 seq;
+	u64 ts_ns;
+	unsigned long iova;
+	phys_addr_t paddr;
+	size_t size;
+	unsigned long aux0;
+	unsigned long aux1;
+	unsigned long caller;
+	int prot;
+	pid_t pid;
+	int cpu;
+	enum iommu_diag_event event;
+	struct iommu_domain *domain;
+	struct device *dev;
+	char domain_name[IOMMU_DOMAIN_NAME_LEN];
+	char dev_name[IOMMU_DIAG_NAME_LEN];
+	char comm[TASK_COMM_LEN];
+};
+
+static DEFINE_SPINLOCK(iommu_diag_lock);
+static u64 iommu_diag_seq;
+static struct iommu_diag_entry iommu_diag_history[IOMMU_DIAG_HISTORY_SIZE];
+
+static const char *iommu_diag_event_str(enum iommu_diag_event event)
+{
+	switch (event) {
+	case IOMMU_DIAG_MAP:
+		return "map";
+	case IOMMU_DIAG_UNMAP:
+		return "unmap";
+	case IOMMU_DIAG_MAP_SG:
+		return "map_sg";
+	case IOMMU_DIAG_ICNSS_MAP:
+		return "icnss_map";
+	case IOMMU_DIAG_ICNSS_MAP_FAIL:
+		return "icnss_map_fail";
+	case IOMMU_DIAG_MSM_DMA_MAP:
+		return "msm_dma_map";
+	case IOMMU_DIAG_MSM_DMA_REUSE:
+		return "msm_dma_reuse";
+	case IOMMU_DIAG_MSM_DMA_MAP_FAIL:
+		return "msm_dma_map_fail";
+	case IOMMU_DIAG_MSM_DMA_UNMAP_REQ:
+		return "msm_dma_unmap_req";
+	case IOMMU_DIAG_MSM_DMA_UNMAP_RELEASE:
+		return "msm_dma_unmap_release";
+	case IOMMU_DIAG_MSM_DMA_UNMAP_MISS:
+		return "msm_dma_unmap_miss";
+	default:
+		return "unknown";
+	}
+}
+
+static bool iommu_diag_overlap(const struct iommu_diag_entry *entry,
+			       unsigned long fault_iova)
+{
+	unsigned long end;
+
+	if (!entry->size)
+		return false;
+
+	end = entry->iova + entry->size - 1;
+	if (end < entry->iova)
+		end = ~0UL;
+
+	return fault_iova >= entry->iova && fault_iova <= end;
+}
+
+void iommu_diag_record(enum iommu_diag_event event,
+		       struct iommu_domain *domain,
+		       struct device *dev,
+		       unsigned long iova,
+		       phys_addr_t paddr,
+		       size_t size,
+		       int prot,
+		       unsigned long aux0,
+		       unsigned long aux1,
+		       unsigned long caller)
+{
+	struct iommu_diag_entry *entry;
+	unsigned long flags;
+	u64 seq;
+
+	spin_lock_irqsave(&iommu_diag_lock, flags);
+	seq = ++iommu_diag_seq;
+	entry = &iommu_diag_history[(seq - 1) % IOMMU_DIAG_HISTORY_SIZE];
+	memset(entry, 0, sizeof(*entry));
+	entry->seq = seq;
+	entry->ts_ns = ktime_get_mono_fast_ns();
+	entry->event = event;
+	entry->domain = domain;
+	entry->dev = dev;
+	entry->iova = iova;
+	entry->paddr = paddr;
+	entry->size = size;
+	entry->prot = prot;
+	entry->aux0 = aux0;
+	entry->aux1 = aux1;
+	entry->caller = caller;
+	entry->pid = current->pid;
+	entry->cpu = raw_smp_processor_id();
+	strlcpy(entry->comm, current->comm, sizeof(entry->comm));
+	if (domain)
+		strlcpy(entry->domain_name, domain->name,
+			sizeof(entry->domain_name));
+	if (dev)
+		strlcpy(entry->dev_name, dev_name(dev), sizeof(entry->dev_name));
+	spin_unlock_irqrestore(&iommu_diag_lock, flags);
+}
+EXPORT_SYMBOL_GPL(iommu_diag_record);
+
+static void iommu_diag_dump_entry(const struct iommu_diag_entry *entry,
+				  bool overlap)
+{
+	pr_err("diag[%llu]%s ts=%lluns cpu=%d pid=%d comm=%s event=%s domain=%s dev=%s iova=0x%lx size=0x%zx paddr=%pa prot=0x%x aux0=0x%lx aux1=0x%lx caller=%pS\n",
+	       entry->seq, overlap ? " hit" : "",
+	       entry->ts_ns, entry->cpu, entry->pid, entry->comm,
+	       iommu_diag_event_str(entry->event),
+	       entry->domain_name[0] ? entry->domain_name : "<none>",
+	       entry->dev_name[0] ? entry->dev_name : "<none>",
+	       entry->iova, entry->size, &entry->paddr, entry->prot,
+	       entry->aux0, entry->aux1, (void *)entry->caller);
+}
+
+void iommu_diag_dump_for_fault(struct device *fault_dev,
+			       struct iommu_domain *domain,
+			       unsigned long iova)
+{
+	struct iommu_diag_entry entry;
+	u64 end_seq, start_seq, seq;
+	int overlap_hits = 0, context_hits = 0;
+
+	spin_lock_irq(&iommu_diag_lock);
+	end_seq = iommu_diag_seq;
+	start_seq = end_seq > IOMMU_DIAG_HISTORY_SIZE ?
+		end_seq - IOMMU_DIAG_HISTORY_SIZE + 1 : 1;
+	spin_unlock_irq(&iommu_diag_lock);
+
+	pr_err("Recent IOMMU history for iova=0x%lx domain=%s dev=%s\n",
+	       iova, domain ? domain->name : "<none>",
+	       fault_dev ? dev_name(fault_dev) : "<none>");
+
+	for (seq = start_seq; seq <= end_seq; seq++) {
+		bool overlap, same_domain, same_dev;
+		unsigned long flags;
+
+		spin_lock_irqsave(&iommu_diag_lock, flags);
+		entry = iommu_diag_history[(seq - 1) % IOMMU_DIAG_HISTORY_SIZE];
+		spin_unlock_irqrestore(&iommu_diag_lock, flags);
+
+		if (entry.seq != seq)
+			continue;
+
+		overlap = iommu_diag_overlap(&entry, iova);
+		same_domain = domain && entry.domain == domain;
+		same_dev = fault_dev && entry.dev == fault_dev;
+		if (!overlap && !same_domain && !same_dev)
+			continue;
+		if (!overlap && context_hits >= IOMMU_DIAG_DUMP_LIMIT)
+			continue;
+
+		iommu_diag_dump_entry(&entry, overlap);
+		if (overlap)
+			overlap_hits++;
+		else
+			context_hits++;
+	}
+
+	if (!overlap_hits) {
+		pr_err("No recent history overlapped iova=0x%lx; this suggests never-valid, aged-out history, or reuse outside the captured window\n",
+		       iova);
+	}
+}
+EXPORT_SYMBOL_GPL(iommu_diag_dump_for_fault);
 
 struct iommu_callback_data {
 	const struct iommu_ops *ops;
@@ -1404,8 +1587,11 @@ int iommu_map(struct iommu_domain *domain, unsigned long iova,
 	/* unroll mapping in case something went wrong */
 	if (ret)
 		iommu_unmap(domain, orig_iova, orig_size - size);
-	else
+	else {
+		iommu_diag_record(IOMMU_DIAG_MAP, domain, NULL, orig_iova,
+				  orig_paddr, orig_size, prot, 0, 0, _RET_IP_);
 		trace_map(domain, orig_iova, orig_paddr, orig_size, prot);
+	}
 
 	return ret;
 }
@@ -1458,6 +1644,8 @@ size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
 		unmapped += unmapped_page;
 	}
 
+	iommu_diag_record(IOMMU_DIAG_UNMAP, domain, NULL, orig_iova, 0, size,
+			  0, unmapped, 0, _RET_IP_);
 	trace_unmap(domain, orig_iova, size, unmapped);
 	return unmapped;
 }
@@ -1470,6 +1658,8 @@ size_t iommu_map_sg(struct iommu_domain *domain,
 	size_t mapped;
 
 	mapped = domain->ops->map_sg(domain, iova, sg, nents, prot);
+	iommu_diag_record(IOMMU_DIAG_MAP_SG, domain, NULL, iova, 0, mapped,
+			  prot, nents, 0, _RET_IP_);
 	trace_map_sg(domain, iova, mapped, prot);
 	return mapped;
 }

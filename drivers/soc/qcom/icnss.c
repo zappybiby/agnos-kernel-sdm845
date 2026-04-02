@@ -3528,12 +3528,19 @@ int icnss_smmu_map(struct device *dev,
 			rounddown(paddr, PAGE_SIZE), len,
 			IOMMU_READ | IOMMU_WRITE);
 	if (ret) {
+		iommu_diag_record(IOMMU_DIAG_ICNSS_MAP_FAIL,
+				  priv->smmu_mapping ? priv->smmu_mapping->domain : NULL,
+				  dev, iova, rounddown(paddr, PAGE_SIZE), len,
+				  IOMMU_READ | IOMMU_WRITE, ret, size, _RET_IP_);
 		icnss_pr_err("PA to IOVA mapping failed, ret %d\n", ret);
 		return ret;
 	}
 
 	priv->smmu_iova_ipa_start = iova + len;
 	*iova_addr = (uint32_t)(iova + paddr - rounddown(paddr, PAGE_SIZE));
+	iommu_diag_record(IOMMU_DIAG_ICNSS_MAP, priv->smmu_mapping->domain, dev,
+			  *iova_addr, paddr, size, IOMMU_READ | IOMMU_WRITE,
+			  len, iova, _RET_IP_);
 
 	return 0;
 }

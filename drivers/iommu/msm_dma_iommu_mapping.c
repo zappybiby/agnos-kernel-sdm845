@@ -17,6 +17,7 @@
 #include <linux/rbtree.h>
 #include <linux/mutex.h>
 #include <linux/err.h>
+#include <linux/iommu.h>
 #include <asm/barrier.h>
 
 #include <linux/msm_dma_iommu_mapping.h>
@@ -190,11 +191,15 @@ static inline int __msm_dma_map_sg(struct device *dev, struct scatterlist *sg,
 			goto out_unlock;
 		}
 
-		ret = dma_map_sg_attrs(dev, sg, nents, dir, attrs);
-		if (ret != nents) {
-			kfree(iommu_map);
-			goto out_unlock;
-		}
+			ret = dma_map_sg_attrs(dev, sg, nents, dir, attrs);
+			if (ret != nents) {
+				iommu_diag_record(IOMMU_DIAG_MSM_DMA_MAP_FAIL, NULL,
+						  dev, sg->dma_address,
+						  sg_phys(sg), sg->length, 0,
+						  ret, attrs, _RET_IP_);
+				kfree(iommu_map);
+				goto out_unlock;
+			}
 
 		kref_init(&iommu_map->ref);
 		if (late_unmap)
@@ -204,13 +209,18 @@ static inline int __msm_dma_map_sg(struct device *dev, struct scatterlist *sg,
 		iommu_map->sgl.dma_length = sg->dma_length;
 		iommu_map->dev = dev;
 		iommu_map->dir = dir;
-		iommu_map->nents = nents;
-		iommu_map->map_attrs = attrs;
-		iommu_map->buf_start_addr = sg_phys(sg);
-		msm_iommu_add(iommu_meta, iommu_map);
+			iommu_map->nents = nents;
+			iommu_map->map_attrs = attrs;
+			iommu_map->buf_start_addr = sg_phys(sg);
+			msm_iommu_add(iommu_meta, iommu_map);
+			iommu_diag_record(IOMMU_DIAG_MSM_DMA_MAP, NULL, dev,
+					  sg->dma_address, sg_phys(sg),
+					  sg->dma_length, 0, nents,
+					  ((unsigned long)dir << 16) | attrs,
+					  _RET_IP_);
 
-	} else {
-		if (nents == iommu_map->nents &&
+		} else {
+			if (nents == iommu_map->nents &&
 		    dir == iommu_map->dir &&
 		    attrs == iommu_map->map_attrs &&
 		    sg_phys(sg) == iommu_map->buf_start_addr) {
@@ -218,29 +228,41 @@ static inline int __msm_dma_map_sg(struct device *dev, struct scatterlist *sg,
 			sg->dma_length = iommu_map->sgl.dma_length;
 
 			kref_get(&iommu_map->ref);
-			if (is_device_dma_coherent(dev))
-				/*
-				 * Ensure all outstanding changes for coherent
-				 * buffers are applied to the cache before any
-				 * DMA occurs.
-				 */
-				dmb(ish);
-			ret = nents;
-		} else {
-			bool start_diff = (sg_phys(sg) !=
-					   iommu_map->buf_start_addr);
+				if (is_device_dma_coherent(dev))
+					/*
+					 * Ensure all outstanding changes for coherent
+					 * buffers are applied to the cache before any
+					 * DMA occurs.
+					 */
+					dmb(ish);
+				iommu_diag_record(IOMMU_DIAG_MSM_DMA_REUSE, NULL,
+						  dev, sg->dma_address,
+						  sg_phys(sg), sg->dma_length, 0,
+						  nents,
+						  ((unsigned long)dir << 16) | attrs,
+						  _RET_IP_);
+				ret = nents;
+			} else {
+				bool start_diff = (sg_phys(sg) !=
+						   iommu_map->buf_start_addr);
 
-			dev_err(dev, "lazy map request differs:\n"
+				dev_err(dev, "lazy map request differs:\n"
 				"req dir:%d, original dir:%d\n"
 				"req nents:%d, original nents:%d\n"
 				"req map attrs:%lu, original map attrs:%lu\n"
 				"req buffer start address differs:%d\n",
 				dir, iommu_map->dir, nents,
 				iommu_map->nents, attrs, iommu_map->map_attrs,
-				start_diff);
-			ret = -EINVAL;
+					start_diff);
+				iommu_diag_record(IOMMU_DIAG_MSM_DMA_MAP_FAIL, NULL,
+						  dev, sg->dma_address,
+						  sg_phys(sg), sg->length, 0,
+						  -EINVAL,
+						  ((unsigned long)dir << 16) | attrs,
+						  _RET_IP_);
+				ret = -EINVAL;
+			}
 		}
-	}
 	mutex_unlock(&iommu_meta->lock);
 	return ret;
 
@@ -314,9 +336,14 @@ static void msm_iommu_meta_put(struct msm_iommu_meta *meta)
 static void msm_iommu_map_release(struct kref *kref)
 {
 	struct msm_iommu_map *map = container_of(kref, struct msm_iommu_map,
-						ref);
+							ref);
 
 	list_del(&map->lnode);
+	iommu_diag_record(IOMMU_DIAG_MSM_DMA_UNMAP_RELEASE, NULL, map->dev,
+			  map->sgl.dma_address, map->buf_start_addr,
+			  map->sgl.dma_length, 0, map->nents,
+			  ((unsigned long)map->dir << 16) | map->map_attrs,
+			  _RET_IP_);
 	dma_unmap_sg(map->dev, &map->sgl, map->nents, map->dir);
 	kfree(map);
 }
@@ -341,8 +368,13 @@ void msm_dma_unmap_sg(struct device *dev, struct scatterlist *sgl, int nents,
 	iommu_map = msm_iommu_lookup(meta, dev);
 
 	if (!iommu_map) {
+		iommu_diag_record(IOMMU_DIAG_MSM_DMA_UNMAP_MISS, NULL, dev,
+				  sgl ? sgl->dma_address : 0,
+				  sgl ? sg_phys(sgl) : 0,
+				  sgl ? sgl->dma_length : 0, 0, nents, dir,
+				  _RET_IP_);
 		WARN(1, "%s: (%p) was never mapped for device  %p\n", __func__,
-				dma_buf, dev);
+					dma_buf, dev);
 		mutex_unlock(&meta->lock);
 		goto out;
 	}
@@ -351,6 +383,11 @@ void msm_dma_unmap_sg(struct device *dev, struct scatterlist *sgl, int nents,
 		WARN(1, "%s: (%pK) dir:%d differs from original dir:%d\n",
 		     __func__, dma_buf, dir, iommu_map->dir);
 
+	iommu_diag_record(IOMMU_DIAG_MSM_DMA_UNMAP_REQ, NULL, dev,
+			  iommu_map->sgl.dma_address, iommu_map->buf_start_addr,
+			  iommu_map->sgl.dma_length, 0, nents,
+			  ((unsigned long)dir << 16) | iommu_map->map_attrs,
+			  _RET_IP_);
 	kref_put(&iommu_map->ref, msm_iommu_map_release);
 	mutex_unlock(&meta->lock);
 
