@@ -47,6 +47,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <soc/qcom/scm.h>
 #include <soc/qcom/secure_buffer.h>
 #include <linux/of_platform.h>
@@ -322,6 +323,10 @@ static bool disable_bypass;
 module_param(disable_bypass, bool, S_IRUGO);
 MODULE_PARM_DESC(disable_bypass,
 	"Disable bypass streams such that incoming transactions from devices that are not attached to an iommu domain will report an abort back to the device and will not be allowed to pass through the SMMU.");
+static unsigned int fault_panic_delay_ms = 30000;
+module_param(fault_panic_delay_ms, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(fault_panic_delay_ms,
+	"Delay in milliseconds before panicking after an unhandled arm-smmu context fault.");
 
 enum arm_smmu_arch_version {
 	ARM_SMMU_V1,
@@ -518,6 +523,8 @@ struct arm_smmu_cfg {
 #define ARM_SMMU_CB_ASID(smmu, cfg)		((cfg)->asid)
 #define ARM_SMMU_CB_VMID(smmu, cfg) ((u16)(smmu)->cavium_id_base + (cfg)->cbndx + 1)
 
+#define ARM_SMMU_FAULT_SHARED_CB_LOG_LIMIT	8
+
 enum arm_smmu_domain_stage {
 	ARM_SMMU_DOMAIN_S1 = 0,
 	ARM_SMMU_DOMAIN_S2,
@@ -621,6 +628,237 @@ static size_t msm_secure_smmu_map_sg(struct iommu_domain *domain,
 static struct arm_smmu_domain *to_smmu_domain(struct iommu_domain *dom)
 {
 	return container_of(dom, struct arm_smmu_domain, domain);
+}
+
+struct arm_smmu_fault_panic_info {
+	struct arm_smmu_device		*smmu;
+	unsigned long			iova;
+	u32				fsr;
+	u32				fsynr;
+	u32				sid;
+	u8				cbndx;
+};
+
+static DEFINE_SPINLOCK(arm_smmu_fault_panic_lock);
+static atomic_t arm_smmu_fault_panic_queued = ATOMIC_INIT(0);
+static struct arm_smmu_fault_panic_info arm_smmu_fault_panic_info;
+
+static const char *arm_smmu_domain_stage_str(enum arm_smmu_domain_stage stage)
+{
+	switch (stage) {
+	case ARM_SMMU_DOMAIN_S1:
+		return "s1";
+	case ARM_SMMU_DOMAIN_S2:
+		return "s2";
+	case ARM_SMMU_DOMAIN_NESTED:
+		return "nested";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *arm_smmu_context_fmt_str(enum arm_smmu_context_fmt fmt)
+{
+	switch (fmt) {
+	case ARM_SMMU_CTX_FMT_NONE:
+		return "none";
+	case ARM_SMMU_CTX_FMT_AARCH64:
+		return "aarch64";
+	case ARM_SMMU_CTX_FMT_AARCH32_L:
+		return "aarch32-l";
+	case ARM_SMMU_CTX_FMT_AARCH32_S:
+		return "aarch32-s";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *arm_smmu_s2cr_type_str(enum arm_smmu_s2cr_type type)
+{
+	switch (type) {
+	case S2CR_TYPE_TRANS:
+		return "trans";
+	case S2CR_TYPE_BYPASS:
+		return "bypass";
+	case S2CR_TYPE_FAULT:
+		return "fault";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *arm_smmu_s2cr_privcfg_str(enum arm_smmu_s2cr_privcfg privcfg)
+{
+	switch (privcfg) {
+	case S2CR_PRIVCFG_DEFAULT:
+		return "default";
+	case S2CR_PRIVCFG_DIPAN:
+		return "dipan";
+	case S2CR_PRIVCFG_UNPRIV:
+		return "unpriv";
+	case S2CR_PRIVCFG_PRIV:
+		return "priv";
+	default:
+		return "unknown";
+	}
+}
+
+static void arm_smmu_fault_panic_work_fn(struct work_struct *work)
+{
+	struct arm_smmu_fault_panic_info info;
+	unsigned long flags;
+
+	spin_lock_irqsave(&arm_smmu_fault_panic_lock, flags);
+	info = arm_smmu_fault_panic_info;
+	spin_unlock_irqrestore(&arm_smmu_fault_panic_lock, flags);
+
+	if (info.smmu)
+		dev_emerg(info.smmu->dev,
+			  "Panicking after deferred arm-smmu fault: cb=%u sid=0x%x iova=0x%08lx fsr=0x%x fsynr=0x%x\n",
+			  info.cbndx, info.sid, info.iova, info.fsr, info.fsynr);
+
+	panic("Unhandled arm-smmu context fault");
+}
+
+static DECLARE_DELAYED_WORK(arm_smmu_fault_panic_work,
+			    arm_smmu_fault_panic_work_fn);
+
+static void arm_smmu_schedule_fault_panic(struct arm_smmu_device *smmu,
+					  unsigned long iova, u32 fsr,
+					  u32 fsynr, u32 sid, u8 cbndx)
+{
+	unsigned long flags;
+
+	if (atomic_cmpxchg(&arm_smmu_fault_panic_queued, 0, 1)) {
+		dev_err(smmu->dev,
+			"Deferred panic already queued for an earlier arm-smmu context fault\n");
+		return;
+	}
+
+	spin_lock_irqsave(&arm_smmu_fault_panic_lock, flags);
+	arm_smmu_fault_panic_info = (struct arm_smmu_fault_panic_info) {
+		.smmu = smmu,
+		.iova = iova,
+		.fsr = fsr,
+		.fsynr = fsynr,
+		.sid = sid,
+		.cbndx = cbndx,
+	};
+	spin_unlock_irqrestore(&arm_smmu_fault_panic_lock, flags);
+
+	schedule_delayed_work(&arm_smmu_fault_panic_work,
+			      msecs_to_jiffies(fault_panic_delay_ms));
+	dev_err(smmu->dev,
+		"Deferred panic scheduled in %u ms for unhandled arm-smmu context fault\n",
+		fault_panic_delay_ms);
+}
+
+static void arm_smmu_dump_stream_mappings(struct arm_smmu_domain *smmu_domain,
+					  u32 sid)
+{
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	unsigned int i, shared = 0;
+
+	mutex_lock(&smmu->stream_map_mutex);
+	if (smmu->smrs) {
+		for (i = 0; i < smmu->num_mapping_groups; i++) {
+			struct arm_smmu_smr *smr = &smmu->smrs[i];
+			struct arm_smmu_s2cr *s2cr = &smmu->s2crs[i];
+			bool sid_match;
+			bool shared_cb;
+
+			if (!smr->valid)
+				continue;
+
+			sid_match = !((sid ^ smr->id) & ~smr->mask);
+			shared_cb = s2cr->attach_count && s2cr->cbndx == cfg->cbndx;
+			if (!sid_match && !shared_cb)
+				continue;
+			if (shared_cb && !sid_match &&
+			    shared >= ARM_SMMU_FAULT_SHARED_CB_LOG_LIMIT)
+				continue;
+
+			dev_err(smmu->dev,
+				"stream map[%u]: match=%u shared_cb=%u smr(id=0x%x mask=0x%x) s2cr(type=%s privcfg=%s cb=%u attach=%d count=%d group=%d handoff=%u)\n",
+				i, sid_match, shared_cb, smr->id, smr->mask,
+				arm_smmu_s2cr_type_str(s2cr->type),
+				arm_smmu_s2cr_privcfg_str(s2cr->privcfg),
+				s2cr->cbndx, s2cr->attach_count, s2cr->count,
+				s2cr->group ? iommu_group_id(s2cr->group) : -1,
+				s2cr->cb_handoff);
+
+			if (shared_cb && !sid_match)
+				shared++;
+		}
+	} else if (sid < smmu->num_mapping_groups) {
+		struct arm_smmu_s2cr *s2cr = &smmu->s2crs[sid];
+
+		dev_err(smmu->dev,
+			"stream map[%u]: stream-indexed s2cr(type=%s privcfg=%s cb=%u attach=%d count=%d group=%d handoff=%u)\n",
+			sid, arm_smmu_s2cr_type_str(s2cr->type),
+			arm_smmu_s2cr_privcfg_str(s2cr->privcfg),
+			s2cr->cbndx, s2cr->attach_count, s2cr->count,
+			s2cr->group ? iommu_group_id(s2cr->group) : -1,
+			s2cr->cb_handoff);
+	}
+
+	mutex_unlock(&smmu->stream_map_mutex);
+}
+
+static void arm_smmu_dump_fault_context(struct iommu_domain *domain,
+					unsigned long iova, u32 fsr,
+					u32 fsynr, u32 sid,
+					phys_addr_t phys_soft,
+					phys_addr_t phys_atos)
+{
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	void __iomem *cb_base;
+	void __iomem *gr1_base;
+	u64 pte = arm_smmu_iova_to_pte(domain, iova);
+	u64 ttbr0, ttbr1;
+	u32 sctlr, actlr, ttbcr, ttbcr2, contextidr, mair0, mair1, cbar, cba2r;
+
+	cb_base = ARM_SMMU_CB_BASE(smmu) + ARM_SMMU_CB(smmu, cfg->cbndx);
+	gr1_base = ARM_SMMU_GR1(smmu);
+
+	sctlr = readl_relaxed(cb_base + ARM_SMMU_CB_SCTLR);
+	actlr = readl_relaxed(cb_base + ARM_SMMU_CB_ACTLR);
+	ttbcr = readl_relaxed(cb_base + ARM_SMMU_CB_TTBCR);
+	ttbcr2 = readl_relaxed(cb_base + ARM_SMMU_CB_TTBCR2);
+	contextidr = readl_relaxed(cb_base + ARM_SMMU_CB_CONTEXTIDR);
+	mair0 = readl_relaxed(cb_base + ARM_SMMU_CB_S1_MAIR0);
+	mair1 = readl_relaxed(cb_base + ARM_SMMU_CB_S1_MAIR1);
+	ttbr0 = readq_relaxed(cb_base + ARM_SMMU_CB_TTBR0);
+	ttbr1 = readq_relaxed(cb_base + ARM_SMMU_CB_TTBR1);
+	cbar = readl_relaxed(gr1_base + ARM_SMMU_GR1_CBAR(cfg->cbndx));
+	cba2r = readl_relaxed(gr1_base + ARM_SMMU_GR1_CBA2R(cfg->cbndx));
+
+	dev_err(smmu->dev,
+		"fault context: client=%s driver=%s of=%s stage=%s fmt=%s cb=%u asid=%u irpt=%u sid=0x%x fsynr=0x%x iova_page=0x%08lx offset=0x%03lx\n",
+		smmu_domain->dev ? dev_name(smmu_domain->dev) : "<none>",
+		(smmu_domain->dev && smmu_domain->dev->driver) ?
+			smmu_domain->dev->driver->name : "<none>",
+		(smmu_domain->dev && smmu_domain->dev->of_node) ?
+			smmu_domain->dev->of_node->full_name : "<none>",
+		arm_smmu_domain_stage_str(smmu_domain->stage),
+		arm_smmu_context_fmt_str(cfg->fmt), cfg->cbndx, cfg->asid,
+		cfg->irptndx, sid, fsynr, iova & PAGE_MASK, iova & ~PAGE_MASK);
+	dev_err(smmu->dev,
+		"fault config: cbar=0x%08x cba2r=0x%08x sctlr=0x%08x actlr=0x%08x ttbcr=0x%08x ttbcr2=0x%08x contextidr=0x%08x\n",
+		cbar, cba2r, sctlr, actlr, ttbcr, ttbcr2, contextidr);
+	dev_err(smmu->dev,
+		"fault tables: ttbr0=0x%016llx ttbr1=0x%016llx mair0=0x%08x mair1=0x%08x quirks=0x%lx pgsize_bitmap=0x%lx ias=%u oas=%u pte=0x%016llx\n",
+		ttbr0, ttbr1, mair0, mair1, smmu_domain->pgtbl_cfg.quirks,
+		smmu_domain->pgtbl_cfg.pgsize_bitmap, smmu_domain->pgtbl_cfg.ias,
+		smmu_domain->pgtbl_cfg.oas, pte);
+	dev_err(smmu->dev,
+		"fault translation: soft=%pa hard=%pa low_offset=0x%02lx\n",
+		&phys_soft, &phys_atos, iova & 0xfff);
+
+	arm_smmu_dump_stream_mappings(smmu_domain, sid);
 }
 
 static void parse_driver_options(struct arm_smmu_device *smmu)
@@ -1542,13 +1780,18 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 			else
 				dev_err(smmu->dev, "hard iova-to-phys (ATOS) failed\n");
 			dev_err(smmu->dev, "SID=0x%x\n", frsynra);
+			arm_smmu_dump_fault_context(domain, iova, fsr, fsynr,
+						    frsynra, phys_soft,
+						    phys_atos);
 		}
-		ret = IRQ_NONE;
+		ret = IRQ_HANDLED;
 		resume = RESUME_TERMINATE;
 		if (!non_fatal_fault) {
 			dev_err(smmu->dev,
-				"Unhandled arm-smmu context fault!\n");
-			BUG();
+				"Unhandled arm-smmu context fault; capturing stack and deferring panic\n");
+			dump_stack();
+			arm_smmu_schedule_fault_panic(smmu, iova, fsr, fsynr,
+						     frsynra, cfg->cbndx);
 		}
 	}
 
@@ -2711,7 +2954,7 @@ static uint64_t arm_smmu_iova_to_pte(struct iommu_domain *domain,
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct io_pgtable_ops *ops = smmu_domain->pgtbl_ops;
 
-	if (!ops)
+	if (!ops || !ops->iova_to_pte)
 		return 0;
 
 	spin_lock_irqsave(&smmu_domain->pgtbl_lock, flags);

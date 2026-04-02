@@ -36,6 +36,7 @@
 #include <linux/ipc_logging.h>
 #include <linux/thread_info.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 #include <linux/qpnp/qpnp-adc.h>
 #include <linux/etherdevice.h>
 #include <linux/of_gpio.h>
@@ -55,6 +56,8 @@
 #ifdef CONFIG_ICNSS_DEBUG
 unsigned long qmi_timeout = 10000;
 module_param(qmi_timeout, ulong, 0600);
+static unsigned int assert_panic_delay_ms = 10000;
+module_param(assert_panic_delay_ms, uint, 0600);
 
 #define WLFW_TIMEOUT_MS			qmi_timeout
 #else
@@ -476,12 +479,80 @@ static struct icnss_priv {
 } *penv;
 
 #ifdef CONFIG_ICNSS_DEBUG
+struct icnss_assert_panic_info {
+	struct icnss_priv *priv;
+	const char *reason;
+	unsigned long state;
+	bool force_err_fatal;
+	bool allow_recursive_recovery;
+	bool early_crash_ind;
+};
+
+static DEFINE_SPINLOCK(icnss_assert_panic_lock);
+static atomic_t icnss_assert_panic_queued = ATOMIC_INIT(0);
+static struct icnss_assert_panic_info icnss_assert_panic_info;
+
+static void icnss_assert_panic_work_fn(struct work_struct *work)
+{
+	struct icnss_assert_panic_info info;
+	unsigned long flags;
+
+	spin_lock_irqsave(&icnss_assert_panic_lock, flags);
+	info = icnss_assert_panic_info;
+	spin_unlock_irqrestore(&icnss_assert_panic_lock, flags);
+
+	if (info.priv)
+		icnss_pr_err("Panicking after deferred ICNSS assert: reason=%s state=0x%lx force_err_fatal=%d allow_recursive_recovery=%d early_crash_ind=%d\n",
+			     info.reason ? info.reason : "<none>", info.state,
+			     info.force_err_fatal, info.allow_recursive_recovery,
+			     info.early_crash_ind);
+
+	panic("Deferred ICNSS assert");
+}
+
+static DECLARE_DELAYED_WORK(icnss_assert_panic_work,
+			    icnss_assert_panic_work_fn);
+
+static void icnss_handle_debug_assert(struct icnss_priv *priv,
+				      const char *reason)
+{
+	unsigned long flags;
+
+	icnss_pr_err("ASSERT suppressed for diagnostics: %s state=0x%lx force_err_fatal=%d allow_recursive_recovery=%d early_crash_ind=%d\n",
+		     reason, priv->state, priv->force_err_fatal,
+		     priv->allow_recursive_recovery, priv->early_crash_ind);
+	dump_stack();
+
+	if (atomic_cmpxchg(&icnss_assert_panic_queued, 0, 1)) {
+		icnss_pr_err("Deferred ICNSS panic already queued\n");
+		return;
+	}
+
+	spin_lock_irqsave(&icnss_assert_panic_lock, flags);
+	icnss_assert_panic_info = (struct icnss_assert_panic_info) {
+		.priv = priv,
+		.reason = reason,
+		.state = priv->state,
+		.force_err_fatal = priv->force_err_fatal,
+		.allow_recursive_recovery = priv->allow_recursive_recovery,
+		.early_crash_ind = priv->early_crash_ind,
+	};
+	spin_unlock_irqrestore(&icnss_assert_panic_lock, flags);
+
+	schedule_delayed_work(&icnss_assert_panic_work,
+			      msecs_to_jiffies(assert_panic_delay_ms));
+	icnss_pr_err("Deferred ICNSS panic scheduled in %u ms\n",
+		     assert_panic_delay_ms);
+}
+
 static void icnss_ignore_qmi_timeout(bool ignore)
 {
 	ignore_qmi_timeout = ignore;
 }
 #else
 static void icnss_ignore_qmi_timeout(bool ignore) { }
+static void icnss_handle_debug_assert(struct icnss_priv *priv,
+				      const char *reason) { }
 #endif
 
 static int icnss_assign_msa_perm(struct icnss_mem_region_info
@@ -2456,8 +2527,11 @@ static int icnss_driver_event_pd_service_down(struct icnss_priv *priv,
 		goto out;
 	}
 
-	if (priv->force_err_fatal)
-		ICNSS_ASSERT(0);
+	if (priv->force_err_fatal) {
+		icnss_handle_debug_assert(priv,
+					  "pd_service_down: force_err_fatal");
+		goto out;
+	}
 
 	if (priv->early_crash_ind) {
 		icnss_pr_dbg("PD Down ignored as early indication is processed: %d, state: 0x%lx\n",
@@ -2468,8 +2542,11 @@ static int icnss_driver_event_pd_service_down(struct icnss_priv *priv,
 	if (test_bit(ICNSS_PD_RESTART, &priv->state) && event_data->crashed) {
 		icnss_pr_err("PD Down while recovery inprogress, crashed: %d, state: 0x%lx\n",
 			     event_data->crashed, priv->state);
-		if (!priv->allow_recursive_recovery)
-			ICNSS_ASSERT(0);
+		if (!priv->allow_recursive_recovery) {
+			icnss_handle_debug_assert(priv,
+						  "pd_service_down: recursive_recovery_disabled");
+			goto out;
+		}
 		goto out;
 	}
 
