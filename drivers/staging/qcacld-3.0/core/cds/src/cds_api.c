@@ -1263,7 +1263,7 @@ v_CONTEXT_t cds_get_global_context(void)
 } /* cds_get_global_context() */
 
 void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
-			   const char *reason)
+			   const char *reason, u64 ref_ts_ns)
 {
 	hdd_context_t *hdd_ctx;
 
@@ -1276,15 +1276,21 @@ void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 		  "%s: dumping WLAN history reason=%s mac_count=%u dp_count=%u",
 		  __func__, reason ? reason : "<none>", mac_count, dp_count);
 
+	/*
+	 * Print transport history first so the most actionable WMI/HTC state is
+	 * preserved even when crash output is truncated by ramoops.
+	 */
+	cds_dump_wlan_transport_history();
+
 	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
 	if (hdd_ctx) {
-		wlan_hdd_dump_connectivity_history(hdd_ctx, reason);
+		wlan_hdd_dump_connectivity_history(hdd_ctx, reason,
+						  ref_ts_ns);
 		hdd_ipa_dump_fault_history(hdd_ctx, reason);
 	}
 
 	qdf_trace_dump_all(gp_cds_context->pMACContext, 0, 0, mac_count, 0);
 	qdf_dp_trace_dump_all(dp_count);
-	cds_dump_wlan_transport_history();
 }
 
 /**

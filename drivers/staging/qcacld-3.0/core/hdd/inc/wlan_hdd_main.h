@@ -2725,7 +2725,7 @@ void wlan_hdd_record_connectivity_event(hdd_adapter_t *adapter,
 		const uint8_t *bssid, const uint8_t *ssid,
 		uint8_t ssid_len, int signal_override);
 void wlan_hdd_dump_connectivity_history(hdd_context_t *hdd_ctx,
-					const char *reason);
+					const char *reason, u64 ref_ts_ns);
 const char *hdd_get_fwpath(void);
 void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind);
 hdd_adapter_t *hdd_get_adapter_by_sme_session_id(hdd_context_t *hdd_ctx,

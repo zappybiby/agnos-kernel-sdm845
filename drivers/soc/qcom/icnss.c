@@ -244,10 +244,10 @@ struct icnss_diag_alloc {
 
 #if IS_REACHABLE(CONFIG_QCA_CLD_WLAN)
 extern void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
-				  const char *reason);
+				  const char *reason, u64 ref_ts_ns);
 #else
 static inline void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
-					 const char *reason)
+					 const char *reason, u64 ref_ts_ns)
 {
 }
 #endif
@@ -505,6 +505,7 @@ static struct icnss_priv {
 	bool early_crash_ind;
 	atomic_t wlan_dump_queued;
 	const char *wlan_dump_reason;
+	u64 wlan_dump_ref_ts_ns;
 	u8 cause_for_rejuvenation;
 	u8 requesting_sub_system;
 	u16 line_number;
@@ -751,26 +752,32 @@ static void icnss_diag_dump_wlan_work_fn(struct work_struct *work)
 	struct icnss_priv *priv = container_of(work, struct icnss_priv,
 					       wlan_dump_work);
 
-	icnss_pr_err("Dumping WLAN trace rings: reason=%s state=0x%lx force_err_fatal=%d early_crash_ind=%d\n",
+	icnss_pr_err("Dumping WLAN trace rings: reason=%s ref_ts=%lluns state=0x%lx force_err_fatal=%d early_crash_ind=%d\n",
 		     priv->wlan_dump_reason ? priv->wlan_dump_reason : "<none>",
+		     priv->wlan_dump_ref_ts_ns,
 		     priv->state, priv->force_err_fatal, priv->early_crash_ind);
 
 	cds_dump_wlan_history(ICNSS_DIAG_WLAN_MAC_DUMP_COUNT,
 			      ICNSS_DIAG_WLAN_DP_DUMP_COUNT,
-			      priv->wlan_dump_reason);
+			      priv->wlan_dump_reason,
+			      priv->wlan_dump_ref_ts_ns);
 }
 
 void icnss_diag_queue_wlan_dump(struct device *dev, const char *reason)
 {
 	struct icnss_priv *priv = dev_get_drvdata(dev);
+	u64 ref_ts_ns;
 
 	if (!priv)
 		return;
+
+	ref_ts_ns = ktime_get_mono_fast_ns();
 
 	if (atomic_cmpxchg(&priv->wlan_dump_queued, 0, 1))
 		return;
 
 	priv->wlan_dump_reason = reason;
+	priv->wlan_dump_ref_ts_ns = ref_ts_ns;
 
 	if (priv->event_wq)
 		queue_work(priv->event_wq, &priv->wlan_dump_work);

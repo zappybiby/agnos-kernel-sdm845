@@ -8065,15 +8065,38 @@ hdd_connectivity_diag_dump_summary(hdd_adapter_t *adapter)
 }
 
 static void
-hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry)
+hdd_connectivity_diag_format_tminus(char *buf, size_t buf_len, u64 ref_ts_ns,
+				       u64 entry_ts_ns)
 {
+	u64 delta_ms = 0;
+	u64 delta_sec;
+	u32 delta_ms_rem;
+
+	if (ref_ts_ns > entry_ts_ns)
+		delta_ms = div_u64(ref_ts_ns - entry_ts_ns, NSEC_PER_MSEC);
+
+	delta_sec = div_u64(delta_ms, MSEC_PER_SEC);
+	delta_ms_rem = delta_ms % MSEC_PER_SEC;
+
+	scnprintf(buf, buf_len, "t_minus=%llu.%03us",
+		  delta_sec, delta_ms_rem);
+}
+
+static void
+hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry,
+				 u64 ref_ts_ns)
+{
+	char tminus[32];
 	u32 reason;
 	u32 status_code;
 
+	hdd_connectivity_diag_format_tminus(tminus, sizeof(tminus), ref_ts_ns,
+					      entry->ts_ns);
+
 	switch (entry->event) {
 	case HDD_CONNECTIVITY_DIAG_CONNECT_REQ:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s chan=%u auth=%u explicit_bssid=%u hint_bssid=%u ssid=%.*s bssid=%pM state=%s signal=%d\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s chan=%u auth=%u explicit_bssid=%u hint_bssid=%u ssid=%.*s bssid=%pM state=%s signal=%d\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8085,8 +8108,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 		       entry->signal);
 		break;
 	case HDD_CONNECTIVITY_DIAG_DISCONNECT_REQ:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s reason=%u state=%s bssid=%pM ssid=%.*s signal=%d\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s reason=%u state=%s bssid=%pM ssid=%.*s signal=%d\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8097,8 +8120,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 		       entry->signal);
 		break;
 	case HDD_CONNECTIVITY_DIAG_SCAN_REQ:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s scan_id=%u source=%s n_ssids=%u n_channels=%u flags=0x%x bssid=%pM state=%s signal=%d\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s scan_id=%u source=%s n_ssids=%u n_channels=%u flags=0x%x bssid=%pM state=%s signal=%d\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8112,8 +8135,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 		       entry->signal);
 		break;
 	case HDD_CONNECTIVITY_DIAG_SCAN_DONE:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s scan_id=%u source=%s status=%u aborted=%u age_ms=%u state=%s signal=%d\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s scan_id=%u source=%s status=%u aborted=%u age_ms=%u state=%s signal=%d\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8129,8 +8152,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 	case HDD_CONNECTIVITY_DIAG_ROAM:
 		reason = entry->aux2 & 0xffff;
 		status_code = entry->aux2 >> 16;
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s roam_status=%u roam_result=%u reason=%u status_code=%u ssid=%.*s bssid=%pM freq=%u ch=%u signal=%d noise=%d roam_count=%u state=%s\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s roam_status=%u roam_result=%u reason=%u status_code=%u ssid=%.*s bssid=%pM freq=%u ch=%u signal=%d noise=%d roam_count=%u state=%s\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8142,8 +8165,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 				entry->conn_state));
 		break;
 	case HDD_CONNECTIVITY_DIAG_CONN_STATE:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s old=%s new=%s bssid=%pM ssid=%.*s signal=%d\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s old=%s new=%s bssid=%pM ssid=%.*s signal=%d\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8153,8 +8176,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 		       entry->signal);
 		break;
 	case HDD_CONNECTIVITY_DIAG_AUTH_STATE:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s old=%u new=%u state=%s bssid=%pM ssid=%.*s\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s old=%u new=%u state=%s bssid=%pM ssid=%.*s\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8164,8 +8187,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 		       entry->bssid, entry->ssid_len, entry->ssid);
 		break;
 	case HDD_CONNECTIVITY_DIAG_CONNECT_RESULT:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s status=%u connect_timeout=%u timeout_reason=%u bssid=%pM ssid=%.*s freq=%u ch=%u signal=%d\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s status=%u connect_timeout=%u timeout_reason=%u bssid=%pM ssid=%.*s freq=%u ch=%u signal=%d\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8174,8 +8197,8 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 		       entry->channel, entry->signal);
 		break;
 	default:
-		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s aux0=0x%x aux1=0x%x aux2=0x%x\n",
-		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		pr_err("WLAN diag[%llu] %s ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s aux0=0x%x aux1=0x%x aux2=0x%x\n",
+		       entry->seq, tminus, entry->ts_ns, entry->cpu, entry->pid,
 		       entry->comm, entry->ifname,
 		       hdd_device_mode_to_string(entry->device_mode),
 		       hdd_connectivity_diag_event_to_string(entry->event),
@@ -8185,17 +8208,22 @@ hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry
 }
 
 void wlan_hdd_dump_connectivity_history(hdd_context_t *hdd_ctx,
-					const char *reason)
+					const char *reason, u64 ref_ts_ns)
 {
 	hdd_adapter_t *adapter = NULL;
 	hdd_adapter_list_node_t *adapter_node = NULL, *next = NULL;
 	QDF_STATUS status;
+	u64 dump_ref_ts_ns;
 
 	if (!hdd_ctx)
 		return;
 
-	pr_err("WLAN connectivity timeline dump: reason=%s\n",
-	       reason ? reason : "<none>");
+	dump_ref_ts_ns = ref_ts_ns;
+	if (!dump_ref_ts_ns)
+		dump_ref_ts_ns = ktime_get_mono_fast_ns();
+
+	pr_err("WLAN connectivity timeline dump: reason=%s order=newest->oldest ref_ts=%lluns entries_show=t_minus_from_trigger\n",
+	       reason ? reason : "<none>", dump_ref_ts_ns);
 
 	status = hdd_get_front_adapter(hdd_ctx, &adapter_node);
 	while (NULL != adapter_node && QDF_STATUS_SUCCESS == status) {
@@ -8231,7 +8259,8 @@ void wlan_hdd_dump_connectivity_history(hdd_context_t *hdd_ctx,
 			if (!entry.seq)
 				continue;
 
-			hdd_connectivity_diag_dump_entry(&entry);
+			hdd_connectivity_diag_dump_entry(&entry,
+							dump_ref_ts_ns);
 		}
 
 		status = hdd_get_next_adapter(hdd_ctx, adapter_node, &next);
