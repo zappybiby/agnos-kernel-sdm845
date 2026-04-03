@@ -245,10 +245,16 @@ struct icnss_diag_alloc {
 #if IS_REACHABLE(CONFIG_QCA_CLD_WLAN)
 extern void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 				  const char *reason, u64 ref_ts_ns);
+extern void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova);
 #else
 static inline void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 					 const char *reason, u64 ref_ts_ns)
 {
+}
+
+static inline void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova)
+{
+	(void)iova;
 }
 #endif
 
@@ -862,6 +868,8 @@ void icnss_diag_dump_iova(struct device *dev, unsigned long iova)
 	if (!hit_count)
 		icnss_pr_err("ICNSS IPA ledger found no handed-out allocation covering iova=0x%lx\n",
 			     iova);
+
+	ol_txrx_dump_htt_rx_ring_for_iova(iova);
 }
 EXPORT_SYMBOL(icnss_diag_dump_iova);
 

@@ -735,14 +735,42 @@ static inline unsigned int htt_rx_in_order_ring_elems(struct htt_pdev_t *pdev)
 void htt_rx_detach(struct htt_pdev_t *pdev)
 {
 	bool ipa_smmu = false;
-
-	qdf_timer_stop(&pdev->rx_ring.refill_retry_timer);
-	qdf_timer_free(&pdev->rx_ring.refill_retry_timer);
-	htt_rx_dbg_rxbuf_deinit(pdev);
+	qdf_dma_addr_t ring_end_paddr = pdev->rx_ring.base_paddr;
+	qdf_dma_addr_t target_idx_paddr = 0;
+	size_t ring_span = pdev->rx_ring.size * sizeof(target_paddr_t);
+	uint32_t alloc_idx = 0;
+	uint32_t target_idx = 0;
 
 	if (qdf_mem_smmu_s1_enabled(pdev->osdev) && pdev->is_ipa_uc_enabled &&
 	    pdev->rx_ring.smmu_map)
 		ipa_smmu = true;
+
+	if (ring_span)
+		ring_end_paddr = pdev->rx_ring.base_paddr + ring_span - 1;
+
+	if (pdev->rx_ring.alloc_idx.vaddr)
+		alloc_idx = *pdev->rx_ring.alloc_idx.vaddr;
+
+	if (pdev->cfg.is_full_reorder_offload) {
+		target_idx_paddr = pdev->rx_ring.target_idx.paddr;
+		if (pdev->rx_ring.target_idx.vaddr)
+			target_idx = *pdev->rx_ring.target_idx.vaddr;
+	}
+
+	qdf_print("HTT RX ring detach: base=%pad end=%pad span=0x%zx elem_size=%zu entries=%d fill_level=%d fill_cnt=%d refill_debt=%d alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%d sw_rd_desc=%u sw_rd_payld=%u ipa_smmu=%d\n",
+		  &pdev->rx_ring.base_paddr, &ring_end_paddr, ring_span,
+		  sizeof(target_paddr_t), pdev->rx_ring.size,
+		  pdev->rx_ring.fill_level, pdev->rx_ring.fill_cnt,
+		  qdf_atomic_read(&pdev->rx_ring.refill_debt),
+		  &pdev->rx_ring.alloc_idx.paddr, alloc_idx,
+		  &target_idx_paddr, target_idx,
+		  pdev->cfg.is_full_reorder_offload,
+		  pdev->rx_ring.sw_rd_idx.msdu_desc,
+		  pdev->rx_ring.sw_rd_idx.msdu_payld, ipa_smmu);
+
+	qdf_timer_stop(&pdev->rx_ring.refill_retry_timer);
+	qdf_timer_free(&pdev->rx_ring.refill_retry_timer);
+	htt_rx_dbg_rxbuf_deinit(pdev);
 
 	if (pdev->cfg.is_full_reorder_offload) {
 		qdf_mem_free_consistent(pdev->osdev, pdev->osdev->dev,
@@ -3672,6 +3700,9 @@ int htt_rx_attach(struct htt_pdev_t *pdev)
 int htt_rx_attach(struct htt_pdev_t *pdev)
 {
 	qdf_dma_addr_t paddr;
+	qdf_dma_addr_t ring_end_paddr;
+	qdf_dma_addr_t target_idx_paddr = 0;
+	size_t ring_span;
 	uint32_t ring_elem_size = sizeof(target_paddr_t);
 
 	pdev->rx_ring.size = htt_rx_ring_size(pdev);
@@ -3797,6 +3828,27 @@ int htt_rx_attach(struct htt_pdev_t *pdev)
 	htt_rx_msdu_desc_key_id = htt_rx_msdu_desc_key_id_ll;
 	htt_rx_msdu_chan_info_present = htt_rx_msdu_chan_info_present_ll;
 	htt_rx_msdu_center_freq = htt_rx_msdu_center_freq_ll;
+	ring_span = pdev->rx_ring.size * ring_elem_size;
+	ring_end_paddr = pdev->rx_ring.base_paddr + ring_span - 1;
+	if (pdev->cfg.is_full_reorder_offload)
+		target_idx_paddr = pdev->rx_ring.target_idx.paddr;
+
+	qdf_print("HTT RX ring attach: base=%pad end=%pad span=0x%zx elem_size=%u entries=%d fill_level=%d fill_cnt=%d refill_debt=%d alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%d sw_rd_desc=%u sw_rd_payld=%u\n",
+		  &pdev->rx_ring.base_paddr, &ring_end_paddr,
+		  ring_span, ring_elem_size,
+		  pdev->rx_ring.size, pdev->rx_ring.fill_level,
+		  pdev->rx_ring.fill_cnt,
+		  qdf_atomic_read(&pdev->rx_ring.refill_debt),
+		  &pdev->rx_ring.alloc_idx.paddr,
+		  pdev->rx_ring.alloc_idx.vaddr ?
+			  *pdev->rx_ring.alloc_idx.vaddr : 0,
+		  &target_idx_paddr,
+		  pdev->cfg.is_full_reorder_offload &&
+			  pdev->rx_ring.target_idx.vaddr ?
+			  *pdev->rx_ring.target_idx.vaddr : 0,
+		  pdev->cfg.is_full_reorder_offload,
+		  pdev->rx_ring.sw_rd_idx.msdu_desc,
+		  pdev->rx_ring.sw_rd_idx.msdu_payld);
 
 	return 0;               /* success */
 
