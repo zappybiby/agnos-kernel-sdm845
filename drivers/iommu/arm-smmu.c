@@ -642,6 +642,7 @@ struct arm_smmu_fault_panic_info {
 
 static DEFINE_SPINLOCK(arm_smmu_fault_panic_lock);
 static atomic_t arm_smmu_fault_panic_queued = ATOMIC_INIT(0);
+static atomic_t arm_smmu_fault_detail_dumped = ATOMIC_INIT(0);
 static struct arm_smmu_fault_panic_info arm_smmu_fault_panic_info;
 
 static const char *arm_smmu_domain_stage_str(enum arm_smmu_domain_stage stage)
@@ -735,11 +736,8 @@ static void arm_smmu_schedule_fault_panic(struct arm_smmu_device *smmu,
 {
 	unsigned long flags;
 
-	if (atomic_cmpxchg(&arm_smmu_fault_panic_queued, 0, 1)) {
-		dev_err(smmu->dev,
-			"Deferred panic already queued for an earlier arm-smmu context fault\n");
+	if (atomic_cmpxchg(&arm_smmu_fault_panic_queued, 0, 1))
 		return;
-	}
 
 	spin_lock_irqsave(&arm_smmu_fault_panic_lock, flags);
 	arm_smmu_fault_panic_info = (struct arm_smmu_fault_panic_info) {
@@ -1709,7 +1707,7 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 	bool non_fatal_fault = !!(smmu_domain->attributes &
 					(1 << DOMAIN_ATTR_NON_FATAL_FAULTS));
 
-	static DEFINE_RATELIMIT_STATE(_rs,
+	static DEFINE_RATELIMIT_STATE(repeat_rs,
 				      DEFAULT_RATELIMIT_INTERVAL,
 				      DEFAULT_RATELIMIT_BURST);
 
@@ -1757,9 +1755,15 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 		ret = IRQ_HANDLED;
 		resume = RESUME_TERMINATE;
 	} else {
-		phys_addr_t phys_atos = arm_smmu_verify_fault(domain, iova,
-							      fsr);
-		if (__ratelimit(&_rs)) {
+		bool first_unhandled_fault;
+
+		first_unhandled_fault =
+			!atomic_cmpxchg(&arm_smmu_fault_detail_dumped, 0, 1);
+		if (first_unhandled_fault) {
+			phys_addr_t phys_atos = arm_smmu_verify_fault(domain,
+								      iova,
+								      fsr);
+
 			dev_err(smmu->dev,
 				"Unhandled context fault: iova=0x%08lx, fsr=0x%x, fsynr=0x%x, cb=%d\n",
 				iova, fsr, fsynr, cfg->cbndx);
@@ -1792,15 +1796,28 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 			arm_smmu_dump_fault_context(domain, iova, fsr, fsynr,
 						    frsynra, phys_soft,
 						    phys_atos);
+		} else if (__ratelimit(&repeat_rs)) {
+			dev_err(smmu->dev,
+				"Repeated unhandled context fault after initial dump: iova=0x%08lx, fsr=0x%x, fsynr=0x%x, cb=%d sid=0x%x; detailed dump suppressed\n",
+				iova, fsr, fsynr, cfg->cbndx, frsynra);
 		}
 		ret = IRQ_HANDLED;
 		resume = RESUME_TERMINATE;
 		if (!non_fatal_fault) {
-			dev_err(smmu->dev,
-				"Unhandled arm-smmu context fault; capturing stack and deferring panic\n");
-			dump_stack();
-			arm_smmu_schedule_fault_panic(smmu, iova, fsr, fsynr,
-						     frsynra, cfg->cbndx);
+			if (first_unhandled_fault) {
+				dev_err(smmu->dev,
+					"Unhandled arm-smmu context fault; capturing stack and deferring panic\n");
+				dump_stack();
+				arm_smmu_schedule_fault_panic(smmu, iova, fsr,
+							      fsynr, frsynra,
+							      cfg->cbndx);
+			} else if (!atomic_read(&arm_smmu_fault_panic_queued)) {
+				dev_err(smmu->dev,
+					"Unhandled arm-smmu context fault; detailed dump already captured, deferring panic\n");
+				arm_smmu_schedule_fault_panic(smmu, iova, fsr,
+							      fsynr, frsynra,
+							      cfg->cbndx);
+			}
 		}
 	}
 
