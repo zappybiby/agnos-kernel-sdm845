@@ -1270,6 +1270,82 @@ struct hdd_ns_offload_info {
 #endif
 
 #define WLAN_HDD_MAX_HISTORY_ENTRY		10
+#define HDD_CONNECTIVITY_DIAG_HISTORY_MAX	64
+#define HDD_CONNECTIVITY_DIAG_SSID_LEN		32
+#define HDD_CONNECTIVITY_DIAG_COMM_LEN		16
+#define HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT (-1000)
+
+/**
+ * enum hdd_connectivity_diag_event - curated WLAN connectivity events
+ * @HDD_CONNECTIVITY_DIAG_CONNECT_REQ: userspace connect request
+ * @HDD_CONNECTIVITY_DIAG_DISCONNECT_REQ: userspace disconnect request
+ * @HDD_CONNECTIVITY_DIAG_SCAN_REQ: scan request queued to firmware
+ * @HDD_CONNECTIVITY_DIAG_SCAN_DONE: scan completion callback
+ * @HDD_CONNECTIVITY_DIAG_ROAM: roam/association state machine event
+ * @HDD_CONNECTIVITY_DIAG_CONN_STATE: HDD connection state transition
+ * @HDD_CONNECTIVITY_DIAG_AUTH_STATE: HDD authentication state transition
+ * @HDD_CONNECTIVITY_DIAG_CONNECT_RESULT: cfg80211 connect result indication
+ */
+enum hdd_connectivity_diag_event {
+	HDD_CONNECTIVITY_DIAG_CONNECT_REQ,
+	HDD_CONNECTIVITY_DIAG_DISCONNECT_REQ,
+	HDD_CONNECTIVITY_DIAG_SCAN_REQ,
+	HDD_CONNECTIVITY_DIAG_SCAN_DONE,
+	HDD_CONNECTIVITY_DIAG_ROAM,
+	HDD_CONNECTIVITY_DIAG_CONN_STATE,
+	HDD_CONNECTIVITY_DIAG_AUTH_STATE,
+	HDD_CONNECTIVITY_DIAG_CONNECT_RESULT,
+};
+
+/**
+ * struct hdd_connectivity_diag_entry - preserved WLAN connectivity timeline
+ * @seq: monotonically increasing sequence number
+ * @ts_ns: monotonic timestamp in nanoseconds
+ * @aux0: event-specific field
+ * @aux1: event-specific field
+ * @aux2: event-specific field
+ * @pid: current task pid when event was recorded
+ * @cpu: cpu on which the event was recorded
+ * @signal: snapshot signal level in dBm
+ * @noise: snapshot noise floor
+ * @event: event type
+ * @session_id: HDD session id
+ * @device_mode: adapter mode
+ * @conn_state: snapshot connection state
+ * @auth_state: snapshot auth state
+ * @roam_count: snapshot roam count
+ * @channel: snapshot operating channel
+ * @freq: snapshot operating frequency
+ * @ssid_len: ssid length in @ssid
+ * @bssid: snapshot bssid
+ * @ifname: interface name
+ * @comm: current task comm
+ * @ssid: snapshot or request ssid
+ */
+struct hdd_connectivity_diag_entry {
+	u64 seq;
+	u64 ts_ns;
+	u32 aux0;
+	u32 aux1;
+	u32 aux2;
+	pid_t pid;
+	int cpu;
+	int signal;
+	int noise;
+	u8 event;
+	u8 session_id;
+	u8 device_mode;
+	u8 conn_state;
+	u8 auth_state;
+	u8 roam_count;
+	u8 channel;
+	u16 freq;
+	u8 ssid_len;
+	u8 bssid[QDF_MAC_ADDR_SIZE];
+	char ifname[IFNAMSIZ];
+	char comm[HDD_CONNECTIVITY_DIAG_COMM_LEN];
+	u8 ssid[HDD_CONNECTIVITY_DIAG_SSID_LEN + 1];
+};
 
 /**
  * struct hdd_netif_queue_stats - netif queue operation statistics
@@ -1608,6 +1684,11 @@ struct hdd_adapter_s {
 	/* BITMAP indicating pause reason */
 	uint32_t pause_map;
 	spinlock_t pause_map_lock;
+	spinlock_t connectivity_diag_lock;
+	u64 connectivity_diag_seq;
+	u8 connectivity_diag_next;
+	struct hdd_connectivity_diag_entry
+		connectivity_diag_history[HDD_CONNECTIVITY_DIAG_HISTORY_MAX];
 	qdf_time_t start_time;
 	qdf_time_t last_time;
 	qdf_time_t total_pause_time;
@@ -2638,6 +2719,13 @@ void wlan_hdd_clear_tx_rx_histogram(hdd_context_t *pHddCtx);
 void wlan_hdd_display_netif_queue_history(hdd_context_t *hdd_ctx,
 			enum qdf_stats_verb_lvl verb_lvl);
 void wlan_hdd_clear_netif_queue_history(hdd_context_t *hdd_ctx);
+void wlan_hdd_record_connectivity_event(hdd_adapter_t *adapter,
+		enum hdd_connectivity_diag_event event,
+		u32 aux0, u32 aux1, u32 aux2,
+		const uint8_t *bssid, const uint8_t *ssid,
+		uint8_t ssid_len, int signal_override);
+void wlan_hdd_dump_connectivity_history(hdd_context_t *hdd_ctx,
+					const char *reason);
 const char *hdd_get_fwpath(void);
 void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind);
 hdd_adapter_t *hdd_get_adapter_by_sme_session_id(hdd_context_t *hdd_ctx,

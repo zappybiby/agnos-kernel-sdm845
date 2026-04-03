@@ -6659,6 +6659,11 @@ hdd_adapter_t *hdd_wlan_create_ap_dev(hdd_context_t *pHddCtx,
 
 		SET_NETDEV_DEV(pWlanHostapdDev, pHddCtx->parent_dev);
 		spin_lock_init(&pHostapdAdapter->pause_map_lock);
+		spin_lock_init(&pHostapdAdapter->connectivity_diag_lock);
+		pHostapdAdapter->connectivity_diag_seq = 0;
+		pHostapdAdapter->connectivity_diag_next = 0;
+		qdf_mem_zero(pHostapdAdapter->connectivity_diag_history,
+			     sizeof(pHostapdAdapter->connectivity_diag_history));
 		pHostapdAdapter->start_time =
 			pHostapdAdapter->last_time = qdf_system_ticks();
 

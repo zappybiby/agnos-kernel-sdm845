@@ -212,6 +212,7 @@ hdd_conn_set_authenticated(hdd_adapter_t *pAdapter, uint8_t authState)
 {
 	hdd_station_ctx_t *pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
 	hdd_context_t *pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+	uint8_t old_auth_state = pHddStaCtx->conn_info.uIsAuthenticated;
 	char *auth_time;
 	uint32_t time_buffer_size;
 
@@ -228,6 +229,10 @@ hdd_conn_set_authenticated(hdd_adapter_t *pAdapter, uint8_t authState)
 							   time_buffer_size);
 	else
 		qdf_mem_set(auth_time, 0x00, time_buffer_size);
+
+	wlan_hdd_record_connectivity_event(pAdapter,
+		HDD_CONNECTIVITY_DIAG_AUTH_STATE, old_auth_state, authState,
+		0, NULL, NULL, 0, HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
 
 	/* Check is pending ROC request or not when auth state changed */
 	schedule_delayed_work(&pHddCtx->roc_req_work, 0);
@@ -247,6 +252,7 @@ void hdd_conn_set_connection_state(hdd_adapter_t *adapter,
 {
 	hdd_station_ctx_t *hdd_sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
 	hdd_context_t *hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+	eConnectionState old_conn_state = hdd_sta_ctx->conn_info.connState;
 	char *connect_time;
 	uint32_t time_buffer_size;
 
@@ -266,6 +272,10 @@ void hdd_conn_set_connection_state(hdd_adapter_t *adapter,
 							   time_buffer_size);
 	else
 		qdf_mem_set(connect_time, 0x00, time_buffer_size);
+
+	wlan_hdd_record_connectivity_event(adapter,
+		HDD_CONNECTIVITY_DIAG_CONN_STATE, old_conn_state, conn_state,
+		0, NULL, NULL, 0, HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
 
 	if (conn_state != eConnectionState_NdiConnected)
 		schedule_delayed_work(&hdd_ctx->roc_req_work, 0);
@@ -5075,6 +5085,25 @@ hdd_sme_roam_callback(void *pContext, tCsrRoamInfo *pRoamInfo, uint32_t roamId,
 	if (eCSR_ROAM_UPDATE_SCAN_RESULT != roamStatus)
 		MTRACE(qdf_trace(QDF_MODULE_ID_HDD, TRACE_CODE_HDD_RX_SME_MSG,
 				 pAdapter->sessionId, roamStatus));
+
+	if (eCSR_ROAM_UPDATE_SCAN_RESULT != roamStatus) {
+		const uint8_t *ssid = NULL;
+		uint8_t ssid_len = 0;
+
+		if (pRoamInfo && pRoamInfo->u.pConnectedProfile) {
+			ssid = pRoamInfo->u.pConnectedProfile->SSID.ssId;
+			ssid_len = pRoamInfo->u.pConnectedProfile->SSID.length;
+		}
+
+		wlan_hdd_record_connectivity_event(pAdapter,
+			HDD_CONNECTIVITY_DIAG_ROAM, roamStatus, roamResult,
+			((pRoamInfo ? pRoamInfo->statusCode : 0) << 16) |
+			(pRoamInfo ? pRoamInfo->reasonCode : 0),
+			pRoamInfo ? pRoamInfo->bssid.bytes : NULL,
+			ssid, ssid_len,
+			pRoamInfo ? pRoamInfo->rxRssi :
+			HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
+	}
 
 	switch (roamStatus) {
 	case eCSR_ROAM_SESSION_OPENED:

@@ -42,6 +42,8 @@
 #include <linux/debugfs.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
+#include <linux/sched.h>
+#include <linux/timekeeping.h>
 #include <wlan_hdd_softap_tx_rx.h>
 #include <ol_txrx_osif_api.h>
 #include <ol_txrx.h>
@@ -68,6 +70,15 @@
 #define HDD_IPA_UC_DEBUG_DUMMY_MEM_SIZE    32000
 #define HDD_IPA_UC_RT_DEBUG_PERIOD         300
 #define HDD_IPA_UC_RT_DEBUG_BUF_COUNT      30
+#define HDD_IPA_DIAG_HISTORY_MAX           64
+
+#define HDD_IPA_DIAG_FLAG_RESOURCE_LOADING BIT(0)
+#define HDD_IPA_DIAG_FLAG_RESOURCE_UNLOADING BIT(1)
+#define HDD_IPA_DIAG_FLAG_PENDING_CONS_REQ BIT(2)
+#define HDD_IPA_DIAG_FLAG_PIPES_DOWN       BIT(3)
+#define HDD_IPA_DIAG_FLAG_UC_LOADED        BIT(4)
+#define HDD_IPA_DIAG_FLAG_WDI_ENABLED      BIT(5)
+#define HDD_IPA_DIAG_FLAG_STA_CONNECTED    BIT(6)
 #define HDD_IPA_UC_RT_DEBUG_FILL_INTERVAL  10000
 
 #define HDD_IPA_WLAN_HDR_DES_MAC_OFFSET    0
@@ -131,6 +142,44 @@ enum hdd_ipa_rm_state {
 	HDD_IPA_RM_RELEASED,
 	HDD_IPA_RM_GRANT_PENDING,
 	HDD_IPA_RM_GRANTED,
+};
+
+enum hdd_ipa_diag_event {
+	HDD_IPA_DIAG_CONS_REQUEST,
+	HDD_IPA_DIAG_CONS_RELEASE,
+	HDD_IPA_DIAG_RM_NOTIFY,
+	HDD_IPA_DIAG_RM_NOTIFY_DEFER,
+	HDD_IPA_DIAG_RM_NOTIFY_HANDLER,
+	HDD_IPA_DIAG_UC_READY_CB,
+	HDD_IPA_DIAG_UC_READY,
+	HDD_IPA_DIAG_FIRST_CONNECT,
+	HDD_IPA_DIAG_LAST_DISCONNECT,
+	HDD_IPA_DIAG_ENABLE_PIPES,
+	HDD_IPA_DIAG_DISABLE_PIPES,
+	HDD_IPA_DIAG_WDI_CTRL,
+	HDD_IPA_DIAG_UC_OP,
+};
+
+struct hdd_ipa_diag_entry {
+	u64 seq;
+	u64 ts_ns;
+	u32 aux0;
+	u32 aux1;
+	u32 aux2;
+	pid_t pid;
+	int cpu;
+	u16 flags;
+	u8 event;
+	u8 rm_state;
+	u8 activated_fw_pipe;
+	u8 num_iface;
+	u8 sap_num_connected_sta;
+	u8 sta_connected;
+	u8 session_id;
+	u8 device_mode;
+	u8 sta_id;
+	char ifname[IFNAMSIZ];
+	char comm[TASK_COMM_LEN];
 };
 
 struct llc_snap_hdr {
@@ -420,6 +469,10 @@ struct hdd_ipa_priv {
 	struct hdd_ipa_iface_context iface_context[HDD_IPA_MAX_IFACE];
 	uint8_t num_iface;
 	enum hdd_ipa_rm_state rm_state;
+	spinlock_t diag_lock;
+	u64 diag_seq;
+	u8 diag_next;
+	struct hdd_ipa_diag_entry diag_history[HDD_IPA_DIAG_HISTORY_MAX];
 	/*
 	 * IPA driver can send RM notifications with IRQ disabled so using qdf
 	 * APIs as it is taken care gracefully. Without this, kernel would throw
@@ -538,6 +591,170 @@ struct hdd_ipa_priv {
 	(((_hdd_ctx)->config->IpaConfig & (_mask)) == (_mask))
 
 #define HDD_BW_GET_DIFF(_x, _y) (unsigned long)((ULONG_MAX - (_y)) + (_x) + 1)
+
+static u16 hdd_ipa_diag_flags(struct hdd_ipa_priv *hdd_ipa)
+{
+	u16 flags = 0;
+
+	if (hdd_ipa->resource_loading)
+		flags |= HDD_IPA_DIAG_FLAG_RESOURCE_LOADING;
+	if (hdd_ipa->resource_unloading)
+		flags |= HDD_IPA_DIAG_FLAG_RESOURCE_UNLOADING;
+	if (hdd_ipa->pending_cons_req)
+		flags |= HDD_IPA_DIAG_FLAG_PENDING_CONS_REQ;
+	if (hdd_ipa->ipa_pipes_down)
+		flags |= HDD_IPA_DIAG_FLAG_PIPES_DOWN;
+	if (hdd_ipa->uc_loaded)
+		flags |= HDD_IPA_DIAG_FLAG_UC_LOADED;
+	if (hdd_ipa->wdi_enabled)
+		flags |= HDD_IPA_DIAG_FLAG_WDI_ENABLED;
+	if (hdd_ipa->sta_connected)
+		flags |= HDD_IPA_DIAG_FLAG_STA_CONNECTED;
+
+	return flags;
+}
+
+static void
+hdd_ipa_record_diag_event(struct hdd_ipa_priv *hdd_ipa,
+			  enum hdd_ipa_diag_event event,
+			  hdd_adapter_t *adapter, uint8_t sta_id,
+			  u32 aux0, u32 aux1, u32 aux2)
+{
+	struct hdd_ipa_diag_entry *entry;
+	unsigned long flags;
+
+	if (!hdd_ipa)
+		return;
+
+	spin_lock_irqsave(&hdd_ipa->diag_lock, flags);
+
+	entry = &hdd_ipa->diag_history[hdd_ipa->diag_next];
+	qdf_mem_zero(entry, sizeof(*entry));
+	entry->seq = ++hdd_ipa->diag_seq;
+	entry->ts_ns = ktime_get_mono_fast_ns();
+	entry->aux0 = aux0;
+	entry->aux1 = aux1;
+	entry->aux2 = aux2;
+	entry->pid = current->pid;
+	entry->cpu = raw_smp_processor_id();
+	entry->flags = hdd_ipa_diag_flags(hdd_ipa);
+	entry->event = event;
+	entry->rm_state = hdd_ipa->rm_state;
+	entry->activated_fw_pipe = hdd_ipa->activated_fw_pipe;
+	entry->num_iface = hdd_ipa->num_iface;
+	entry->sap_num_connected_sta = hdd_ipa->sap_num_connected_sta;
+	entry->sta_connected = hdd_ipa->sta_connected;
+	entry->session_id = 0xff;
+	entry->device_mode = 0xff;
+	entry->sta_id = sta_id;
+
+	strlcpy(entry->comm, current->comm, sizeof(entry->comm));
+	if (adapter) {
+		entry->session_id = adapter->sessionId;
+		entry->device_mode = adapter->device_mode;
+		if (adapter->dev)
+			strlcpy(entry->ifname, adapter->dev->name,
+				sizeof(entry->ifname));
+	}
+
+	hdd_ipa->diag_next++;
+	if (hdd_ipa->diag_next >= HDD_IPA_DIAG_HISTORY_MAX)
+		hdd_ipa->diag_next = 0;
+
+	spin_unlock_irqrestore(&hdd_ipa->diag_lock, flags);
+}
+
+static const char *
+hdd_ipa_diag_event_to_string(enum hdd_ipa_diag_event event)
+{
+	switch (event) {
+	case HDD_IPA_DIAG_CONS_REQUEST:
+		return "cons_request";
+	case HDD_IPA_DIAG_CONS_RELEASE:
+		return "cons_release";
+	case HDD_IPA_DIAG_RM_NOTIFY:
+		return "rm_notify";
+	case HDD_IPA_DIAG_RM_NOTIFY_DEFER:
+		return "rm_notify_defer";
+	case HDD_IPA_DIAG_RM_NOTIFY_HANDLER:
+		return "rm_notify_handler";
+	case HDD_IPA_DIAG_UC_READY_CB:
+		return "uc_ready_cb";
+	case HDD_IPA_DIAG_UC_READY:
+		return "uc_ready";
+	case HDD_IPA_DIAG_FIRST_CONNECT:
+		return "first_connect";
+	case HDD_IPA_DIAG_LAST_DISCONNECT:
+		return "last_disconnect";
+	case HDD_IPA_DIAG_ENABLE_PIPES:
+		return "enable_pipes";
+	case HDD_IPA_DIAG_DISABLE_PIPES:
+		return "disable_pipes";
+	case HDD_IPA_DIAG_WDI_CTRL:
+		return "wdi_ctrl";
+	case HDD_IPA_DIAG_UC_OP:
+		return "uc_op";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *
+hdd_ipa_diag_rm_state_to_string(enum hdd_ipa_rm_state rm_state)
+{
+	switch (rm_state) {
+	case HDD_IPA_RM_RELEASED:
+		return "released";
+	case HDD_IPA_RM_GRANT_PENDING:
+		return "grant_pending";
+	case HDD_IPA_RM_GRANTED:
+		return "granted";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *
+hdd_ipa_diag_rm_event_to_string(enum ipa_rm_event event)
+{
+	switch (event) {
+	case IPA_RM_RESOURCE_GRANTED:
+		return "granted";
+	case IPA_RM_RESOURCE_RELEASED:
+		return "released";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *
+hdd_ipa_diag_uc_opcode_to_string(u32 op_code)
+{
+	switch (op_code) {
+	case HDD_IPA_UC_OPCODE_TX_SUSPEND:
+		return "tx_suspend";
+	case HDD_IPA_UC_OPCODE_TX_RESUME:
+		return "tx_resume";
+	case HDD_IPA_UC_OPCODE_RX_SUSPEND:
+		return "rx_suspend";
+	case HDD_IPA_UC_OPCODE_RX_RESUME:
+		return "rx_resume";
+	case HDD_IPA_UC_OPCODE_STATS:
+		return "stats";
+#ifdef FEATURE_METERING
+	case HDD_IPA_UC_OPCODE_SHARING_STATS:
+		return "sharing_stats";
+	case HDD_IPA_UC_OPCODE_QUOTA_RSP:
+		return "quota_rsp";
+	case HDD_IPA_UC_OPCODE_QUOTA_IND:
+		return "quota_ind";
+#endif
+	case HDD_IPA_UC_OPCODE_UC_READY:
+		return "uc_ready";
+	default:
+		return "unknown";
+	}
+}
 
 #if defined(QCA_WIFI_3_0) && defined(CONFIG_IPA3)
 #define HDD_IPA_WDI2_SET(pipe_in, ipa_ctxt, osdev) \
@@ -707,6 +924,8 @@ static void hdd_ipa_uc_loaded_uc_cb(void *priv_ctxt)
 	if (!list_empty(&uc_op_work->work.entry)) {
 		/* uc_op_work is not initialized yet */
 		hdd_ipa->uc_loaded = true;
+		hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_UC_READY_CB,
+					  NULL, 0xff, 1, 0, 0);
 		return;
 	}
 
@@ -724,6 +943,8 @@ static void hdd_ipa_uc_loaded_uc_cb(void *priv_ctxt)
 
 	uc_op_work->msg = msg;
 	schedule_work(&uc_op_work->work);
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_UC_READY_CB,
+				  NULL, 0xff, 0, 1, 0);
 
 	/* work handler will free the msg buffer */
 	return;
@@ -744,6 +965,7 @@ static int hdd_ipa_uc_send_wdi_control_msg(bool ctrl)
 {
 	struct ipa_msg_meta meta;
 	struct ipa_wlan_msg *ipa_msg;
+	struct hdd_ipa_priv *hdd_ipa = ghdd_ipa;
 	int ret = 0;
 
 	/* WDI enable message to IPA */
@@ -769,6 +991,9 @@ static int hdd_ipa_uc_send_wdi_control_msg(bool ctrl)
 			meta.msg_type,  ret);
 		qdf_mem_free(ipa_msg);
 	}
+
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_WDI_CTRL, NULL, 0xff,
+				  ctrl, ret, meta.msg_type);
 	return ret;
 }
 
@@ -2587,6 +2812,9 @@ static void hdd_ipa_rm_notify(void *user_data, enum ipa_rm_event event,
 		HDD_IPA_LOG(QDF_TRACE_LEVEL_ERROR, "Unknown RM Evt: %d", event);
 		break;
 	}
+
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_RM_NOTIFY, NULL, 0xff,
+				  event, (u32)data, 0);
 }
 
 /**
@@ -2599,6 +2827,8 @@ static void hdd_ipa_rm_notify(void *user_data, enum ipa_rm_event event,
  */
 static int hdd_ipa_rm_cons_release(void)
 {
+	hdd_ipa_record_diag_event(ghdd_ipa, HDD_IPA_DIAG_CONS_RELEASE, NULL,
+				  0xff, 0, 0, 0);
 	return 0;
 }
 
@@ -2626,6 +2856,8 @@ static int hdd_ipa_rm_cons_request(void)
 		ret = -EPERM;
 	}
 
+	hdd_ipa_record_diag_event(ghdd_ipa, HDD_IPA_DIAG_CONS_REQUEST, NULL,
+				  0xff, ret, 0, 0);
 	return ret;
 }
 
@@ -2679,6 +2911,9 @@ hdd_ipa_uc_rm_notify_handler(void *context, enum ipa_rm_event event)
 			    "invalid event code %d",  event);
 		break;
 	}
+
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_RM_NOTIFY_HANDLER,
+				  NULL, 0xff, event, 0, 0);
 }
 
 /**
@@ -2704,6 +2939,8 @@ static void hdd_ipa_uc_rm_notify_defer(struct work_struct *work)
 	event = uc_rm_work->event;
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG,
 		"posted event %d",  event);
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_RM_NOTIFY_DEFER,
+				  NULL, 0xff, event, 0, 0);
 
 	hdd_ipa_uc_rm_notify_handler(hdd_ipa, event);
 	cds_ssr_unprotect(__func__);
@@ -3775,6 +4012,8 @@ static int hdd_ipa_uc_enable_pipes(struct hdd_ipa_priv *hdd_ipa)
 end:
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG, "exit: ipa_pipes_down=%d",
 		    hdd_ipa->ipa_pipes_down);
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_ENABLE_PIPES, NULL,
+				  0xff, result, 0, 0);
 	return result;
 }
 
@@ -3813,6 +4052,8 @@ static int hdd_ipa_uc_disable_pipes(struct hdd_ipa_priv *hdd_ipa)
 end:
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG, "exit: ipa_pipes_down=%d",
 		    hdd_ipa->ipa_pipes_down);
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_DISABLE_PIPES, NULL,
+				  0xff, result, 0, 0);
 	return result;
 }
 
@@ -3824,6 +4065,8 @@ end:
  */
 static int hdd_ipa_uc_handle_first_con(struct hdd_ipa_priv *hdd_ipa)
 {
+	int ret = 0;
+
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG, "enter");
 
 	hdd_ipa->activated_fw_pipe = 0;
@@ -3843,7 +4086,8 @@ static int hdd_ipa_uc_handle_first_con(struct hdd_ipa_priv *hdd_ipa)
 				HDD_IPA_LOG(QDF_TRACE_LEVEL_ERROR,
 					"IPA WDI Pipe activation failed");
 				hdd_ipa->resource_loading = false;
-				return -EBUSY;
+				ret = -EBUSY;
+				goto out;
 			}
 		} else {
 			HDD_IPA_LOG(QDF_TRACE_LEVEL_INFO,
@@ -3857,13 +4101,17 @@ static int hdd_ipa_uc_handle_first_con(struct hdd_ipa_priv *hdd_ipa)
 			HDD_IPA_LOG(QDF_TRACE_LEVEL_ERROR,
 				    "IPA WDI Pipe activation failed");
 			hdd_ipa->resource_loading = false;
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out;
 		}
 		hdd_ipa->resource_loading = false;
 	}
 
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG, "exit: IPA WDI Pipes activated!");
-	return 0;
+out:
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_FIRST_CONNECT, NULL,
+				  0xff, ret, 0, 0);
+	return ret;
 }
 
 /**
@@ -3890,6 +4138,8 @@ static void hdd_ipa_uc_handle_last_discon(struct hdd_ipa_priv *hdd_ipa)
 	ol_txrx_ipa_uc_set_active(pdev, false, false);
 
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG, "exit: IPA WDI Pipes deactivated");
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_LAST_DISCONNECT,
+				  NULL, 0xff, 0, 0, 0);
 }
 
 
@@ -3998,10 +4248,13 @@ static void hdd_ipa_uc_loaded_handler(struct hdd_ipa_priv *ipa_ctxt)
 	qdf_device_t osdev = cds_get_context(QDF_MODULE_ID_QDF_DEVICE);
 	struct ol_txrx_pdev_t *pdev;
 	int ret;
+	bool already_loaded = ipa_ctxt->uc_loaded;
 
 	HDD_IPA_LOG(QDF_TRACE_LEVEL_INFO, "UC READY");
 	if (true == ipa_ctxt->uc_loaded) {
 		HDD_IPA_LOG(QDF_TRACE_LEVEL_DEBUG, "UC already loaded");
+		hdd_ipa_record_diag_event(ipa_ctxt, HDD_IPA_DIAG_UC_READY,
+					  NULL, 0xff, 1, 0, 0);
 		return;
 	}
 
@@ -4023,6 +4276,8 @@ static void hdd_ipa_uc_loaded_handler(struct hdd_ipa_priv *ipa_ctxt)
 	if (ret) {
 		HDD_IPA_LOG(QDF_TRACE_LEVEL_ERROR,
 				"ipa wdi conn pipes failed ret=%d", ret);
+		hdd_ipa_record_diag_event(ipa_ctxt, HDD_IPA_DIAG_UC_READY,
+					  NULL, 0xff, already_loaded, ret, 0);
 		return;
 	}
 
@@ -4036,6 +4291,9 @@ static void hdd_ipa_uc_loaded_handler(struct hdd_ipa_priv *ipa_ctxt)
 			"Client already connected, enable IPA/FW PIPEs");
 		hdd_ipa_uc_handle_first_con(ipa_ctxt);
 	}
+
+	hdd_ipa_record_diag_event(ipa_ctxt, HDD_IPA_DIAG_UC_READY, NULL, 0xff,
+				  already_loaded, ret, 0);
 }
 
 /**
@@ -4061,6 +4319,167 @@ static inline char *hdd_ipa_wlan_event_to_str(enum ipa_wlan_event event)
 	default:
 		return "UNKNOWN";
 	}
+}
+
+static void
+hdd_ipa_diag_dump_entry(const struct hdd_ipa_diag_entry *entry)
+{
+	switch (entry->event) {
+	case HDD_IPA_DIAG_RM_NOTIFY:
+	case HDD_IPA_DIAG_RM_NOTIFY_DEFER:
+	case HDD_IPA_DIAG_RM_NOTIFY_HANDLER:
+		pr_err("WLAN IPA diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s session=%u mode=%u event=%s rm_event=%s(%u) data=0x%x rm=%s num_iface=%u sap_sta=%u sta=%u act=%u loading=%u unloading=%u pending_cons=%u pipes_down=%u uc_loaded=%u wdi_enabled=%u\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname[0] ? entry->ifname : "<none>",
+		       entry->session_id, entry->device_mode,
+		       hdd_ipa_diag_event_to_string(entry->event),
+		       hdd_ipa_diag_rm_event_to_string(entry->aux0), entry->aux0,
+		       entry->aux1,
+		       hdd_ipa_diag_rm_state_to_string(entry->rm_state),
+		       entry->num_iface, entry->sap_num_connected_sta,
+		       entry->sta_connected, entry->activated_fw_pipe,
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_LOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_UNLOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PENDING_CONS_REQ),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PIPES_DOWN),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_UC_LOADED),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_WDI_ENABLED));
+		break;
+	case HDD_IPA_DIAG_UC_OP:
+		pr_err("WLAN IPA diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s session=%u mode=%u event=%s op=%s(%u) len=%u reason=%u rm=%s num_iface=%u sap_sta=%u sta=%u act=%u loading=%u unloading=%u pending_cons=%u pipes_down=%u uc_loaded=%u wdi_enabled=%u\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname[0] ? entry->ifname : "<none>",
+		       entry->session_id, entry->device_mode,
+		       hdd_ipa_diag_event_to_string(entry->event),
+		       hdd_ipa_diag_uc_opcode_to_string(entry->aux0),
+		       entry->aux0, entry->aux1, entry->aux2,
+		       hdd_ipa_diag_rm_state_to_string(entry->rm_state),
+		       entry->num_iface, entry->sap_num_connected_sta,
+		       entry->sta_connected, entry->activated_fw_pipe,
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_LOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_UNLOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PENDING_CONS_REQ),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PIPES_DOWN),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_UC_LOADED),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_WDI_ENABLED));
+		break;
+	case HDD_IPA_DIAG_WDI_CTRL:
+		pr_err("WLAN IPA diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s event=%s ctrl=%u ret=%d rm=%s act=%u loading=%u unloading=%u pending_cons=%u pipes_down=%u uc_loaded=%u wdi_enabled=%u\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, hdd_ipa_diag_event_to_string(entry->event),
+		       entry->aux0, (int)entry->aux1,
+		       hdd_ipa_diag_rm_state_to_string(entry->rm_state),
+		       entry->activated_fw_pipe,
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_LOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_UNLOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PENDING_CONS_REQ),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PIPES_DOWN),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_UC_LOADED),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_WDI_ENABLED));
+		break;
+	default:
+		pr_err("WLAN IPA diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s session=%u mode=%u sta_id=%u event=%s aux0=0x%x aux1=0x%x aux2=0x%x rm=%s num_iface=%u sap_sta=%u sta=%u act=%u loading=%u unloading=%u pending_cons=%u pipes_down=%u uc_loaded=%u wdi_enabled=%u\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname[0] ? entry->ifname : "<none>",
+		       entry->session_id, entry->device_mode, entry->sta_id,
+		       hdd_ipa_diag_event_to_string(entry->event),
+		       entry->aux0, entry->aux1, entry->aux2,
+		       hdd_ipa_diag_rm_state_to_string(entry->rm_state),
+		       entry->num_iface, entry->sap_num_connected_sta,
+		       entry->sta_connected, entry->activated_fw_pipe,
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_LOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_RESOURCE_UNLOADING),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PENDING_CONS_REQ),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_PIPES_DOWN),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_UC_LOADED),
+		       !!(entry->flags & HDD_IPA_DIAG_FLAG_WDI_ENABLED));
+		break;
+	}
+}
+
+void hdd_ipa_dump_fault_history(hdd_context_t *hdd_ctx, const char *reason)
+{
+	struct hdd_ipa_priv *hdd_ipa;
+	u64 seq;
+	u8 next;
+	int i, count;
+
+	if (wlan_hdd_validate_context(hdd_ctx))
+		return;
+
+	hdd_ipa = hdd_ctx->hdd_ipa;
+	if (!hdd_ipa || !hdd_ipa_is_enabled(hdd_ctx)) {
+		pr_err("WLAN IPA diag: reason=%s unavailable\n",
+		       reason ? reason : "<none>");
+		return;
+	}
+
+	pr_err("WLAN IPA diag: reason=%s rm=%s num_iface=%u sap_sta=%u sta=%u act=%u tx_pipe=0x%x rx_pipe=0x%x loading=%u unloading=%u pending_cons=%u pipes_down=%u uc_loaded=%u wdi_enabled=%u tx_diff=%u rx_diff=%u tx_fwd=%llu rx_discard=%llu rx_net_send=%llu rx_drop=%llu\n",
+	       reason ? reason : "<none>",
+	       hdd_ipa_diag_rm_state_to_string(hdd_ipa->rm_state),
+	       hdd_ipa->num_iface, hdd_ipa->sap_num_connected_sta,
+	       hdd_ipa->sta_connected, hdd_ipa->activated_fw_pipe,
+	       hdd_ipa->tx_pipe_handle, hdd_ipa->rx_pipe_handle,
+	       hdd_ipa->resource_loading, hdd_ipa->resource_unloading,
+	       hdd_ipa->pending_cons_req, hdd_ipa->ipa_pipes_down,
+	       hdd_ipa->uc_loaded, hdd_ipa->wdi_enabled,
+	       hdd_ipa->ipa_tx_packets_diff, hdd_ipa->ipa_rx_packets_diff,
+	       hdd_ipa->ipa_tx_forward, hdd_ipa->ipa_rx_discard,
+	       hdd_ipa->ipa_rx_net_send_count,
+	       hdd_ipa->ipa_rx_internal_drop_count);
+
+	if (hdd_ipa_is_rt_debugging_enabled(hdd_ctx)) {
+		pr_err("WLAN IPA rt_debug: fill_index=%u\n",
+		       hdd_ipa->rt_buf_fill_index);
+		for (i = 0; i < HDD_IPA_UC_RT_DEBUG_BUF_COUNT; i++) {
+			int idx = hdd_ipa->rt_buf_fill_index +
+				HDD_IPA_UC_RT_DEBUG_BUF_COUNT - 1 - i;
+			struct uc_rt_debug_info info;
+
+			if (idx >= HDD_IPA_UC_RT_DEBUG_BUF_COUNT)
+				idx -= HDD_IPA_UC_RT_DEBUG_BUF_COUNT;
+
+			info = hdd_ipa->rt_bug_buffer[idx];
+			if (!info.time && !info.ipa_excep_count &&
+			    !info.rx_drop_count && !info.net_sent_count &&
+			    !info.rx_discard_count && !info.tx_fwd_ok_count &&
+			    !info.tx_fwd_count && !info.rx_destructor_call)
+				continue;
+
+			pr_err("WLAN IPA rt[%d] time=%llu excep=%llu rx_drop=%llu net_sent=%llu tx_ok=%llu tx_fwd=%llu dstr=%llu discard=%llu\n",
+			       i, info.time, info.ipa_excep_count,
+			       info.rx_drop_count, info.net_sent_count,
+			       info.tx_fwd_ok_count, info.tx_fwd_count,
+			       info.rx_destructor_call, info.rx_discard_count);
+		}
+	}
+
+	spin_lock_irq(&hdd_ipa->diag_lock);
+	seq = hdd_ipa->diag_seq;
+	next = hdd_ipa->diag_next;
+	spin_unlock_irq(&hdd_ipa->diag_lock);
+
+	count = seq < HDD_IPA_DIAG_HISTORY_MAX ? (int)seq :
+		HDD_IPA_DIAG_HISTORY_MAX;
+	for (i = 0; i < count; i++) {
+		struct hdd_ipa_diag_entry entry;
+		unsigned long flags;
+		int idx = next + HDD_IPA_DIAG_HISTORY_MAX - 1 - i;
+
+		if (idx >= HDD_IPA_DIAG_HISTORY_MAX)
+			idx -= HDD_IPA_DIAG_HISTORY_MAX;
+
+		spin_lock_irqsave(&hdd_ipa->diag_lock, flags);
+		entry = hdd_ipa->diag_history[idx];
+		spin_unlock_irqrestore(&hdd_ipa->diag_lock, flags);
+
+		if (!entry.seq)
+			continue;
+
+		hdd_ipa_diag_dump_entry(&entry);
+	}
+
+	hdd_ipa_dump_info(hdd_ctx);
 }
 
 /**
@@ -4586,6 +5005,10 @@ static void hdd_ipa_uc_op_cb(struct op_msg_type *op_msg, void *usr_ctxt)
 		HDD_IPA_LOG(LOGE, "Invalid message: op_code=%d, reason=%d",
 			    msg->op_code, hdd_ipa->stat_req_reason);
 	}
+
+	hdd_ipa_record_diag_event(hdd_ipa, HDD_IPA_DIAG_UC_OP, NULL, 0xff,
+				  msg->op_code, msg->len,
+				  hdd_ipa->stat_req_reason);
 
 	qdf_mem_free(op_msg);
 }
@@ -7324,6 +7747,10 @@ static QDF_STATUS __hdd_ipa_init(hdd_context_t *hdd_ctx)
 	ghdd_ipa = hdd_ipa;
 	hdd_ipa->hdd_ctx = hdd_ctx;
 	hdd_ipa->num_iface = 0;
+	spin_lock_init(&hdd_ipa->diag_lock);
+	hdd_ipa->diag_seq = 0;
+	hdd_ipa->diag_next = 0;
+	qdf_mem_zero(hdd_ipa->diag_history, sizeof(hdd_ipa->diag_history));
 
 	hdd_ipa_wdi_get_wdi_version(hdd_ipa);
 

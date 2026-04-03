@@ -65,6 +65,8 @@
 #include <linux/ctype.h>
 #include <linux/compat.h>
 #include <linux/reboot.h>
+#include <linux/sched.h>
+#include <linux/timekeeping.h>
 #ifdef MSM_PLATFORM
 #include <soc/qcom/subsystem_restart.h>
 #endif
@@ -325,6 +327,109 @@ const char *hdd_device_mode_to_string(uint8_t device_mode)
 	default:
 		return "Unknown";
 	}
+}
+
+static const char *
+hdd_connectivity_diag_event_to_string(enum hdd_connectivity_diag_event event)
+{
+	switch (event) {
+	case HDD_CONNECTIVITY_DIAG_CONNECT_REQ:
+		return "connect_req";
+	case HDD_CONNECTIVITY_DIAG_DISCONNECT_REQ:
+		return "disconnect_req";
+	case HDD_CONNECTIVITY_DIAG_SCAN_REQ:
+		return "scan_req";
+	case HDD_CONNECTIVITY_DIAG_SCAN_DONE:
+		return "scan_done";
+	case HDD_CONNECTIVITY_DIAG_ROAM:
+		return "roam";
+	case HDD_CONNECTIVITY_DIAG_CONN_STATE:
+		return "conn_state";
+	case HDD_CONNECTIVITY_DIAG_AUTH_STATE:
+		return "auth_state";
+	case HDD_CONNECTIVITY_DIAG_CONNECT_RESULT:
+		return "connect_result";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *hdd_connectivity_diag_conn_state_to_string(u8 conn_state)
+{
+	switch (conn_state) {
+	case eConnectionState_NotConnected:
+		return "not_connected";
+	case eConnectionState_Connecting:
+		return "connecting";
+	case eConnectionState_Associated:
+		return "associated";
+	case eConnectionState_IbssDisconnected:
+		return "ibss_disconnected";
+	case eConnectionState_IbssConnected:
+		return "ibss_connected";
+	case eConnectionState_Disconnecting:
+		return "disconnecting";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *hdd_connectivity_diag_scan_source_to_string(u32 source)
+{
+	switch (source) {
+	case NL_SCAN:
+		return "nl80211";
+	case VENDOR_SCAN:
+		return "vendor";
+	default:
+		return "unknown";
+	}
+}
+
+static bool hdd_connectivity_diag_has_station_ctx(hdd_adapter_t *adapter)
+{
+	switch (adapter->device_mode) {
+	case QDF_STA_MODE:
+	case QDF_P2P_CLIENT_MODE:
+	case QDF_P2P_DEVICE_MODE:
+	case QDF_IBSS_MODE:
+	case QDF_OCB_MODE:
+	case QDF_NDI_MODE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static const connection_info_t *
+hdd_connectivity_diag_conn_info(hdd_adapter_t *adapter)
+{
+	hdd_station_ctx_t *sta_ctx;
+
+	if (!hdd_connectivity_diag_has_station_ctx(adapter))
+		return NULL;
+
+	sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
+	if (sta_ctx->conn_info.connState == eConnectionState_Associated ||
+	    sta_ctx->conn_info.connState == eConnectionState_Connecting ||
+	    sta_ctx->conn_info.connState == eConnectionState_Disconnecting)
+		return &sta_ctx->conn_info;
+
+	if (sta_ctx->cache_conn_info.last_ssid.SSID.length ||
+	    sta_ctx->cache_conn_info.freq ||
+	    !is_zero_ether_addr(sta_ctx->cache_conn_info.bssId.bytes))
+		return &sta_ctx->cache_conn_info;
+
+	return &sta_ctx->conn_info;
+}
+
+static void hdd_connectivity_diag_init(hdd_adapter_t *adapter)
+{
+	spin_lock_init(&adapter->connectivity_diag_lock);
+	adapter->connectivity_diag_seq = 0;
+	adapter->connectivity_diag_next = 0;
+	qdf_mem_zero(adapter->connectivity_diag_history,
+		     sizeof(adapter->connectivity_diag_history));
 }
 
 /**
@@ -3292,6 +3397,7 @@ static hdd_adapter_t *hdd_alloc_station_adapter(hdd_context_t *hdd_ctx,
 		SET_NETDEV_DEV(pWlanDev, hdd_ctx->parent_dev);
 		hdd_wmm_init(adapter);
 		spin_lock_init(&adapter->pause_map_lock);
+		hdd_connectivity_diag_init(adapter);
 		adapter->start_time = adapter->last_time = qdf_system_ticks();
 	}
 
@@ -5675,6 +5781,14 @@ void hdd_connect_result(struct net_device *dev, const u8 *bssid,
 			req_ie_len, resp_ie, resp_ie_len,
 			status, gfp, connect_timeout, timeout_reason);
 	}
+	wlan_hdd_record_connectivity_event(padapter,
+		HDD_CONNECTIVITY_DIAG_CONNECT_RESULT, status,
+		timeout_reason, connect_timeout, bssid,
+		(roam_info && roam_info->u.pConnectedProfile) ?
+			roam_info->u.pConnectedProfile->SSID.ssId : NULL,
+		(roam_info && roam_info->u.pConnectedProfile) ?
+			roam_info->u.pConnectedProfile->SSID.length : 0,
+		HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
 	qdf_runtime_pm_allow_suspend(&hdd_ctx->runtime_context.connect);
 	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_CONNECT);
 }
@@ -5691,6 +5805,14 @@ void hdd_connect_result(struct net_device *dev, const u8 *bssid,
 
 	cfg80211_connect_result(dev, bssid, req_ie, req_ie_len,
 				resp_ie, resp_ie_len, status, gfp);
+	wlan_hdd_record_connectivity_event(padapter,
+		HDD_CONNECTIVITY_DIAG_CONNECT_RESULT, status,
+		timeout_reason, connect_timeout, bssid,
+		(roam_info && roam_info->u.pConnectedProfile) ?
+			roam_info->u.pConnectedProfile->SSID.ssId : NULL,
+		(roam_info && roam_info->u.pConnectedProfile) ?
+			roam_info->u.pConnectedProfile->SSID.length : 0,
+		HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
 	qdf_runtime_pm_allow_suspend(&hdd_ctx->runtime_context.connect);
 	hdd_allow_suspend(WIFI_POWER_EVENT_WAKELOCK_CONNECT);
 }
@@ -7824,6 +7946,299 @@ void wlan_hdd_clear_netif_queue_history(hdd_context_t *hdd_ctx)
 		status = hdd_get_next_adapter(hdd_ctx, adapter_node, &next);
 		adapter_node = next;
 	}
+}
+
+void wlan_hdd_record_connectivity_event(hdd_adapter_t *adapter,
+		enum hdd_connectivity_diag_event event,
+		u32 aux0, u32 aux1, u32 aux2,
+		const uint8_t *bssid, const uint8_t *ssid,
+		uint8_t ssid_len, int signal_override)
+{
+	struct hdd_connectivity_diag_entry *entry;
+	const connection_info_t *conn_info = NULL;
+	unsigned long flags;
+
+	if (!adapter || !adapter->dev)
+		return;
+
+	spin_lock_irqsave(&adapter->connectivity_diag_lock, flags);
+
+	entry = &adapter->connectivity_diag_history[
+		adapter->connectivity_diag_next];
+	qdf_mem_zero(entry, sizeof(*entry));
+
+	entry->seq = ++adapter->connectivity_diag_seq;
+	entry->ts_ns = ktime_get_mono_fast_ns();
+	entry->event = event;
+	entry->aux0 = aux0;
+	entry->aux1 = aux1;
+	entry->aux2 = aux2;
+	entry->pid = current->pid;
+	entry->cpu = raw_smp_processor_id();
+	entry->session_id = adapter->sessionId;
+	entry->device_mode = adapter->device_mode;
+	entry->conn_state = 0xff;
+	entry->auth_state = 0xff;
+	entry->signal = 0;
+	entry->noise = 0;
+
+	strlcpy(entry->ifname, adapter->dev->name, sizeof(entry->ifname));
+	strlcpy(entry->comm, current->comm, sizeof(entry->comm));
+
+	if (hdd_connectivity_diag_has_station_ctx(adapter)) {
+		hdd_station_ctx_t *sta_ctx =
+			WLAN_HDD_GET_STATION_CTX_PTR(adapter);
+
+		entry->conn_state = sta_ctx->conn_info.connState;
+		entry->auth_state = sta_ctx->conn_info.uIsAuthenticated;
+		conn_info = hdd_connectivity_diag_conn_info(adapter);
+		if (conn_info) {
+			entry->roam_count = conn_info->roam_count;
+			entry->channel = conn_info->operationChannel;
+			entry->freq = conn_info->freq;
+			entry->signal = conn_info->signal;
+			entry->noise = conn_info->noise;
+			qdf_mem_copy(entry->bssid, conn_info->bssId.bytes,
+				     QDF_MAC_ADDR_SIZE);
+			entry->ssid_len = min_t(uint8_t,
+						conn_info->last_ssid.SSID.length,
+						HDD_CONNECTIVITY_DIAG_SSID_LEN);
+			if (entry->ssid_len)
+				qdf_mem_copy(entry->ssid,
+					     conn_info->last_ssid.SSID.ssId,
+					     entry->ssid_len);
+		}
+	}
+
+	if (bssid)
+		qdf_mem_copy(entry->bssid, bssid, QDF_MAC_ADDR_SIZE);
+
+	if (ssid && ssid_len) {
+		entry->ssid_len = min_t(uint8_t, ssid_len,
+					HDD_CONNECTIVITY_DIAG_SSID_LEN);
+		qdf_mem_zero(entry->ssid, sizeof(entry->ssid));
+		qdf_mem_copy(entry->ssid, ssid, entry->ssid_len);
+	}
+
+	if (signal_override != HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT)
+		entry->signal = signal_override;
+
+	adapter->connectivity_diag_next++;
+	if (adapter->connectivity_diag_next >=
+	    HDD_CONNECTIVITY_DIAG_HISTORY_MAX)
+		adapter->connectivity_diag_next = 0;
+
+	spin_unlock_irqrestore(&adapter->connectivity_diag_lock, flags);
+}
+
+static void
+hdd_connectivity_diag_dump_summary(hdd_adapter_t *adapter)
+{
+	const connection_info_t *conn_info = hdd_connectivity_diag_conn_info(adapter);
+	hdd_station_ctx_t *sta_ctx;
+	u8 conn_state = 0xff;
+	u8 auth_state = 0xff;
+
+	if (hdd_connectivity_diag_has_station_ctx(adapter)) {
+		sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
+		conn_state = sta_ctx->conn_info.connState;
+		auth_state = sta_ctx->conn_info.uIsAuthenticated;
+	}
+
+	if (!conn_info) {
+		pr_err("WLAN diag adapter if=%s session=%u mode=%s state=%s auth=%u\n",
+		       adapter->dev->name, adapter->sessionId,
+		       hdd_device_mode_to_string(adapter->device_mode),
+		       hdd_connectivity_diag_conn_state_to_string(conn_state),
+		       auth_state);
+		return;
+	}
+
+	pr_err("WLAN diag adapter if=%s session=%u mode=%s state=%s auth=%u ssid=%.*s bssid=%pM freq=%u ch=%u signal=%d noise=%d roam_count=%u\n",
+	       adapter->dev->name, adapter->sessionId,
+	       hdd_device_mode_to_string(adapter->device_mode),
+	       hdd_connectivity_diag_conn_state_to_string(conn_state),
+	       auth_state, conn_info->last_ssid.SSID.length,
+	       conn_info->last_ssid.SSID.ssId, conn_info->bssId.bytes,
+	       conn_info->freq, conn_info->operationChannel,
+	       conn_info->signal, conn_info->noise, conn_info->roam_count);
+}
+
+static void
+hdd_connectivity_diag_dump_entry(const struct hdd_connectivity_diag_entry *entry)
+{
+	u32 reason;
+	u32 status_code;
+
+	switch (entry->event) {
+	case HDD_CONNECTIVITY_DIAG_CONNECT_REQ:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s chan=%u auth=%u explicit_bssid=%u hint_bssid=%u ssid=%.*s bssid=%pM state=%s signal=%d\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0, entry->aux1, entry->aux2 & 0x1,
+		       (entry->aux2 >> 1) & 0x1, entry->ssid_len,
+		       entry->ssid, entry->bssid,
+		       hdd_connectivity_diag_conn_state_to_string(
+				entry->conn_state),
+		       entry->signal);
+		break;
+	case HDD_CONNECTIVITY_DIAG_DISCONNECT_REQ:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s reason=%u state=%s bssid=%pM ssid=%.*s signal=%d\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0,
+		       hdd_connectivity_diag_conn_state_to_string(
+				entry->conn_state),
+		       entry->bssid, entry->ssid_len, entry->ssid,
+		       entry->signal);
+		break;
+	case HDD_CONNECTIVITY_DIAG_SCAN_REQ:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s scan_id=%u source=%s n_ssids=%u n_channels=%u flags=0x%x bssid=%pM state=%s signal=%d\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0,
+		       hdd_connectivity_diag_scan_source_to_string(
+				(entry->aux1 >> 24) & 0xff),
+		       (entry->aux1 >> 16) & 0xff, entry->aux1 & 0xffff,
+		       entry->aux2, entry->bssid,
+		       hdd_connectivity_diag_conn_state_to_string(
+				entry->conn_state),
+		       entry->signal);
+		break;
+	case HDD_CONNECTIVITY_DIAG_SCAN_DONE:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s scan_id=%u source=%s status=%u aborted=%u age_ms=%u state=%s signal=%d\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0,
+		       hdd_connectivity_diag_scan_source_to_string(
+				(entry->aux1 >> 24) & 0xff),
+		       (entry->aux1 >> 8) & 0xffff, entry->aux1 & 0xff,
+		       entry->aux2,
+		       hdd_connectivity_diag_conn_state_to_string(
+				entry->conn_state),
+		       entry->signal);
+		break;
+	case HDD_CONNECTIVITY_DIAG_ROAM:
+		reason = entry->aux2 & 0xffff;
+		status_code = entry->aux2 >> 16;
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s roam_status=%u roam_result=%u reason=%u status_code=%u ssid=%.*s bssid=%pM freq=%u ch=%u signal=%d noise=%d roam_count=%u state=%s\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0, entry->aux1, reason, status_code,
+		       entry->ssid_len, entry->ssid, entry->bssid,
+		       entry->freq, entry->channel, entry->signal,
+		       entry->noise, entry->roam_count,
+		       hdd_connectivity_diag_conn_state_to_string(
+				entry->conn_state));
+		break;
+	case HDD_CONNECTIVITY_DIAG_CONN_STATE:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s old=%s new=%s bssid=%pM ssid=%.*s signal=%d\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       hdd_connectivity_diag_conn_state_to_string(entry->aux0),
+		       hdd_connectivity_diag_conn_state_to_string(entry->aux1),
+		       entry->bssid, entry->ssid_len, entry->ssid,
+		       entry->signal);
+		break;
+	case HDD_CONNECTIVITY_DIAG_AUTH_STATE:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s old=%u new=%u state=%s bssid=%pM ssid=%.*s\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0, entry->aux1,
+		       hdd_connectivity_diag_conn_state_to_string(
+				entry->conn_state),
+		       entry->bssid, entry->ssid_len, entry->ssid);
+		break;
+	case HDD_CONNECTIVITY_DIAG_CONNECT_RESULT:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s status=%u connect_timeout=%u timeout_reason=%u bssid=%pM ssid=%.*s freq=%u ch=%u signal=%d\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0, entry->aux2, entry->aux1, entry->bssid,
+		       entry->ssid_len, entry->ssid, entry->freq,
+		       entry->channel, entry->signal);
+		break;
+	default:
+		pr_err("WLAN diag[%llu] ts=%lluns cpu=%d pid=%d comm=%s if=%s mode=%s event=%s aux0=0x%x aux1=0x%x aux2=0x%x\n",
+		       entry->seq, entry->ts_ns, entry->cpu, entry->pid,
+		       entry->comm, entry->ifname,
+		       hdd_device_mode_to_string(entry->device_mode),
+		       hdd_connectivity_diag_event_to_string(entry->event),
+		       entry->aux0, entry->aux1, entry->aux2);
+		break;
+	}
+}
+
+void wlan_hdd_dump_connectivity_history(hdd_context_t *hdd_ctx,
+					const char *reason)
+{
+	hdd_adapter_t *adapter = NULL;
+	hdd_adapter_list_node_t *adapter_node = NULL, *next = NULL;
+	QDF_STATUS status;
+
+	if (!hdd_ctx)
+		return;
+
+	pr_err("WLAN connectivity timeline dump: reason=%s\n",
+	       reason ? reason : "<none>");
+
+	status = hdd_get_front_adapter(hdd_ctx, &adapter_node);
+	while (NULL != adapter_node && QDF_STATUS_SUCCESS == status) {
+		struct hdd_connectivity_diag_entry entry;
+		unsigned long flags;
+		u64 seq;
+		u8 next_idx;
+		int i, count;
+
+		adapter = adapter_node->pAdapter;
+		hdd_connectivity_diag_dump_summary(adapter);
+
+		spin_lock_irqsave(&adapter->connectivity_diag_lock, flags);
+		seq = adapter->connectivity_diag_seq;
+		next_idx = adapter->connectivity_diag_next;
+		spin_unlock_irqrestore(&adapter->connectivity_diag_lock, flags);
+
+		count = seq < HDD_CONNECTIVITY_DIAG_HISTORY_MAX ?
+			(int)seq : HDD_CONNECTIVITY_DIAG_HISTORY_MAX;
+		for (i = 0; i < count; i++) {
+			int idx = next_idx + HDD_CONNECTIVITY_DIAG_HISTORY_MAX -
+				1 - i;
+
+			if (idx >= HDD_CONNECTIVITY_DIAG_HISTORY_MAX)
+				idx -= HDD_CONNECTIVITY_DIAG_HISTORY_MAX;
+
+			spin_lock_irqsave(&adapter->connectivity_diag_lock,
+					  flags);
+			entry = adapter->connectivity_diag_history[idx];
+			spin_unlock_irqrestore(&adapter->connectivity_diag_lock,
+					       flags);
+
+			if (!entry.seq)
+				continue;
+
+			hdd_connectivity_diag_dump_entry(&entry);
+		}
+
+		status = hdd_get_next_adapter(hdd_ctx, adapter_node, &next);
+		adapter_node = next;
+	}
+
+	wlan_hdd_display_netif_queue_history(hdd_ctx, QDF_STATS_VERB_LVL_LOW);
 }
 
 /**

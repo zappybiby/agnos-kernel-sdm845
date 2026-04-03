@@ -1505,6 +1505,12 @@ static QDF_STATUS hdd_cfg80211_scan_done_callback(tHalHandle halHandle,
 	if (status == eCSR_SCAN_ABORT || status == eCSR_SCAN_FAILURE)
 		aborted = true;
 
+	wlan_hdd_record_connectivity_event(pAdapter,
+		HDD_CONNECTIVITY_DIAG_SCAN_DONE, scanId,
+		(source << 24) | ((u32)status << 8) | aborted,
+		qdf_mc_timer_get_system_time() - scan_time,
+		NULL, NULL, 0, HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
+
 	if (!aborted && !hddctx->beacon_probe_rsp_cnt_per_scan) {
 		hdd_debug("NO SCAN result");
 		if (hddctx->config->bug_report_for_no_scan_results) {
@@ -2506,6 +2512,13 @@ static int __wlan_hdd_cfg80211_scan(struct wiphy *wiphy,
 	if (scan_id)
 		*scan_id = scan_req_id;
 
+	wlan_hdd_record_connectivity_event(pAdapter,
+		HDD_CONNECTIVITY_DIAG_SCAN_REQ, scan_req_id,
+		(source << 24) | (request->n_ssids << 16) |
+		request->n_channels, request->flags,
+		is_zero_ether_addr(request->bssid) ? NULL : request->bssid,
+		NULL, 0, HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
+
 	pAdapter->scan_info.mScanPending = true;
 	status = sme_scan_request(WLAN_HDD_GET_HAL_CTX(pAdapter),
 				pAdapter->sessionId, &scan_req,
@@ -2523,6 +2536,11 @@ static int __wlan_hdd_cfg80211_scan(struct wiphy *wiphy,
 		} else {
 			status = -EIO;
 		}
+		wlan_hdd_record_connectivity_event(pAdapter,
+			HDD_CONNECTIVITY_DIAG_SCAN_DONE, scan_req_id,
+			(source << 24) | ((u32)status << 8) | 1, 0,
+			NULL, NULL, 0,
+			HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
 		wlan_hdd_scan_request_dequeue(pHddCtx, scan_req.scan_id,
 				&req, &source,
 				&timestamp);

@@ -18521,6 +18521,12 @@ static int __wlan_hdd_cfg80211_connect(struct wiphy *wiphy,
 		return -EINVAL;
 	}
 
+	wlan_hdd_record_connectivity_event(pAdapter,
+		HDD_CONNECTIVITY_DIAG_CONNECT_REQ, req->channel ?
+		req->channel->hw_value : 0, req->auth_type,
+		(req->bssid ? 0x1 : 0) | (bssid_hint ? 0x2 : 0), bssid,
+		req->ssid, req->ssid_len, HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
+
 	/*
 	 * Check if this is reassoc to same bssid, if reassoc is success, return
 	 */
@@ -18891,6 +18897,10 @@ static int __wlan_hdd_cfg80211_disconnect(struct wiphy *wiphy,
 			reasonCode = eCSR_DISCONNECT_REASON_UNSPECIFIED;
 			break;
 		}
+		wlan_hdd_record_connectivity_event(pAdapter,
+			HDD_CONNECTIVITY_DIAG_DISCONNECT_REQ, reason, 0, 0,
+			NULL, NULL, 0,
+			HDD_CONNECTIVITY_DIAG_SIGNAL_USE_CURRENT);
 		pScanInfo = &pAdapter->scan_info;
 		if (pScanInfo->mScanPending) {
 			hdd_debug("Disconnect is in progress, Aborting Scan");

@@ -62,6 +62,11 @@
 
 /* Maximum number of cds message queue get wrapper failures to cause panic */
 #define CDS_WRAPPER_MAX_FAIL_COUNT (CDS_CORE_MAX_MESSAGES * 3)
+#define CDS_DIAG_HTC_CREDIT_HISTORY_DUMP_COUNT 128
+#define CDS_DIAG_WMI_CMD_DUMP_COUNT 64
+#define CDS_DIAG_WMI_EVENT_DUMP_COUNT 64
+#define CDS_DIAG_WMI_MGMT_CMD_DUMP_COUNT 32
+#define CDS_DIAG_WMI_MGMT_EVENT_DUMP_COUNT 32
 
 /* Data definitions */
 static cds_context_type g_cds_context;
@@ -72,6 +77,49 @@ static struct __qdf_device g_qdf_ctx;
 static atomic_t cds_wrapper_empty_count;
 
 static uint8_t cds_multicast_logging;
+
+static int cds_diag_printk_adapter(void *priv, const char *fmt, ...)
+{
+	int ret;
+	va_list args;
+
+	va_start(args, fmt);
+	ret = vprintk(fmt, args);
+	ret += printk("\n");
+	va_end(args);
+
+	return ret;
+}
+
+static void cds_dump_wlan_transport_history(void)
+{
+#ifdef WMI_INTERFACE_EVENT_LOGGING
+	qdf_abstract_print *print = &cds_diag_printk_adapter;
+
+	print(NULL, "HTC Credit History (count %u)",
+	      CDS_DIAG_HTC_CREDIT_HISTORY_DUMP_COUNT);
+	cds_print_htc_credit_history(CDS_DIAG_HTC_CREDIT_HISTORY_DUMP_COUNT,
+				     print, NULL);
+
+	print(NULL, "WMI Command Log (count %u)",
+	      CDS_DIAG_WMI_CMD_DUMP_COUNT);
+	wma_print_wmi_cmd_log(CDS_DIAG_WMI_CMD_DUMP_COUNT, print, NULL);
+
+	print(NULL, "WMI Event Log (count %u)",
+	      CDS_DIAG_WMI_EVENT_DUMP_COUNT);
+	wma_print_wmi_event_log(CDS_DIAG_WMI_EVENT_DUMP_COUNT, print, NULL);
+
+	print(NULL, "WMI Mgmt Command Log (count %u)",
+	      CDS_DIAG_WMI_MGMT_CMD_DUMP_COUNT);
+	wma_print_wmi_mgmt_cmd_log(CDS_DIAG_WMI_MGMT_CMD_DUMP_COUNT,
+				   print, NULL);
+
+	print(NULL, "WMI Mgmt Event Log (count %u)",
+	      CDS_DIAG_WMI_MGMT_EVENT_DUMP_COUNT);
+	wma_print_wmi_mgmt_event_log(CDS_DIAG_WMI_MGMT_EVENT_DUMP_COUNT,
+				     print, NULL);
+#endif
+}
 
 void cds_sys_probe_thread_cback(void *pUserData);
 static void cds_trigger_recovery_work(void *param);
@@ -1217,6 +1265,8 @@ v_CONTEXT_t cds_get_global_context(void)
 void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 			   const char *reason)
 {
+	hdd_context_t *hdd_ctx;
+
 	if (gp_cds_context == NULL) {
 		pr_err("%s: global cds context is NULL", __func__);
 		return;
@@ -1226,8 +1276,15 @@ void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 		  "%s: dumping WLAN history reason=%s mac_count=%u dp_count=%u",
 		  __func__, reason ? reason : "<none>", mac_count, dp_count);
 
+	hdd_ctx = cds_get_context(QDF_MODULE_ID_HDD);
+	if (hdd_ctx) {
+		wlan_hdd_dump_connectivity_history(hdd_ctx, reason);
+		hdd_ipa_dump_fault_history(hdd_ctx, reason);
+	}
+
 	qdf_trace_dump_all(gp_cds_context->pMACContext, 0, 0, mac_count, 0);
 	qdf_dp_trace_dump_all(dp_count);
+	cds_dump_wlan_transport_history();
 }
 
 /**

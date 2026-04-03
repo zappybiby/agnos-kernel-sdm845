@@ -88,6 +88,7 @@ int hdd_ipa_resume(hdd_context_t *hdd_ctx);
 void hdd_ipa_uc_stat_query(hdd_context_t *hdd_ctx, uint32_t *ipa_tx_diff,
 	uint32_t *ipa_rx_diff);
 void hdd_ipa_uc_rt_debug_host_dump(hdd_context_t *hdd_ctx);
+void hdd_ipa_dump_fault_history(hdd_context_t *hdd_ctx, const char *reason);
 void hdd_ipa_uc_stat_request(hdd_context_t *hdd_ctx, uint8_t reason);
 void hdd_ipa_uc_sharing_stats_request(hdd_adapter_t *adapter,
 				      uint8_t reset_stats);
@@ -245,6 +246,11 @@ static inline void hdd_ipa_uc_stat_request(hdd_adapter_t *adapter,
 }
 
 static inline void hdd_ipa_uc_rt_debug_host_dump(hdd_context_t *hdd_ctx)
+{
+}
+
+static inline void hdd_ipa_dump_fault_history(hdd_context_t *hdd_ctx,
+					      const char *reason)
 {
 }
 
