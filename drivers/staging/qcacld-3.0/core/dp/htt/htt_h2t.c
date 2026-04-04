@@ -427,6 +427,8 @@ QDF_STATUS htt_h2t_rx_ring_cfg_msg_ll(struct htt_pdev_t *pdev)
 
 	/* rewind beyond alignment pad to get to the HTC header reserved area */
 	qdf_nbuf_push_head(msg, HTC_HDR_ALIGNMENT_PADDING);
+	htt_rx_ring_diag_gen_advance(pdev, HTT_RX_RING_GEN_REASON_FW_CFG,
+				     _RET_IP_);
 
 	*msg_word = 0;
 	HTT_H2T_MSG_TYPE_SET(*msg_word, HTT_H2T_MSG_TYPE_RX_RING_CFG);
@@ -636,6 +638,8 @@ htt_h2t_rx_ring_cfg_msg_hl(struct htt_pdev_t *pdev)
 
 	/* rewind beyond alignment pad to get to the HTC header reserved area */
 	qdf_nbuf_push_head(msg, HTC_HDR_ALIGNMENT_PADDING);
+	htt_rx_ring_diag_gen_advance(pdev, HTT_RX_RING_GEN_REASON_FW_CFG,
+				     _RET_IP_);
 
 	*msg_word = 0;
 	HTT_H2T_MSG_TYPE_SET(*msg_word, HTT_H2T_MSG_TYPE_RX_RING_CFG);

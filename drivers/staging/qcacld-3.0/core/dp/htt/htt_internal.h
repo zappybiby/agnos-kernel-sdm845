@@ -391,6 +391,24 @@ static inline void htt_print_rx_desc(struct htt_host_rx_desc_base *rx_desc)
 #define HTT_LOG2_MAX_CACHE_LINE_SIZE 7  /* 2^7 = 128 */
 #define HTT_MAX_CACHE_LINE_SIZE_MASK ((1 << HTT_LOG2_MAX_CACHE_LINE_SIZE) - 1)
 
+enum htt_rx_ring_gen_reason {
+	HTT_RX_RING_GEN_REASON_ATTACH,
+	HTT_RX_RING_GEN_REASON_FW_CFG,
+	HTT_RX_RING_GEN_REASON_DETACH,
+};
+
+enum htt_rx_ring_slot_event_type {
+	HTT_RX_RING_SLOT_EVENT_FILL,
+	HTT_RX_RING_SLOT_EVENT_POP,
+	HTT_RX_RING_SLOT_EVENT_HASH_POP,
+	HTT_RX_RING_SLOT_EVENT_SMMU_MAP,
+	HTT_RX_RING_SLOT_EVENT_SMMU_UNMAP,
+	HTT_RX_RING_SLOT_EVENT_DETACH_UNMAP,
+	HTT_RX_RING_SLOT_EVENT_DETACH_FREE,
+	HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_UNMAP,
+	HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_FREE,
+};
+
 #ifdef BIG_ENDIAN_HOST
 /*
  * big-endian: bytes within a 4-byte "word" are swapped:
@@ -530,6 +548,13 @@ extern QDF_STATUS htt_h2t_rx_ring_cfg_msg_hl(struct htt_pdev_t *pdev);
 
 extern QDF_STATUS (*htt_h2t_rx_ring_cfg_msg)(struct htt_pdev_t *pdev);
 
+void htt_rx_ring_diag_gen_advance(struct htt_pdev_t *pdev, uint8_t reason,
+				  unsigned long caller);
+void htt_rx_ring_diag_gen_update_current(struct htt_pdev_t *pdev,
+					 unsigned long caller);
+void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
+				     unsigned long iova);
+
 enum htc_send_full_action htt_h2t_full(void *context, HTC_PACKET *pkt);
 
 struct htt_htc_pkt *htt_htc_pkt_alloc(struct htt_pdev_t *pdev);
@@ -550,7 +575,8 @@ void htt_htc_misc_pkt_pool_free(struct htt_pdev_t *pdev);
 int
 htt_rx_hash_list_insert(struct htt_pdev_t *pdev,
 			qdf_dma_addr_t paddr,
-			qdf_nbuf_t netbuf);
+			qdf_nbuf_t netbuf, uint16_t slot_idx,
+			uint32_t gen);
 
 qdf_nbuf_t
 htt_rx_hash_list_lookup(struct htt_pdev_t *pdev, qdf_dma_addr_t paddr);

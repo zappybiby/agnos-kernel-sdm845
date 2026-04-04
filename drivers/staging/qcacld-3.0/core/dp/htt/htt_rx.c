@@ -34,6 +34,7 @@
 #include <qdf_types.h>          /* qdf_print, bool */
 #include <qdf_nbuf.h>           /* qdf_nbuf_t, etc. */
 #include <qdf_timer.h>		/* qdf_timer_free */
+#include <linux/timekeeping.h>
 
 #include <htt.h>                /* HTT_HL_RX_DESC_SIZE */
 #include <ol_cfg.h>
@@ -119,6 +120,397 @@
 
 #ifndef CONFIG_HL_SUPPORT
 
+#define HTT_RX_RING_SLOT_DUMP_COUNT 8
+
+static const char *htt_rx_ring_gen_reason_to_string(uint8_t reason)
+{
+	switch (reason) {
+	case HTT_RX_RING_GEN_REASON_ATTACH:
+		return "attach";
+	case HTT_RX_RING_GEN_REASON_FW_CFG:
+		return "fw_cfg";
+	case HTT_RX_RING_GEN_REASON_DETACH:
+		return "detach";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *htt_rx_ring_slot_event_to_string(uint8_t event)
+{
+	switch (event) {
+	case HTT_RX_RING_SLOT_EVENT_FILL:
+		return "fill";
+	case HTT_RX_RING_SLOT_EVENT_POP:
+		return "pop";
+	case HTT_RX_RING_SLOT_EVENT_HASH_POP:
+		return "hash_pop";
+	case HTT_RX_RING_SLOT_EVENT_SMMU_MAP:
+		return "smmu_map";
+	case HTT_RX_RING_SLOT_EVENT_SMMU_UNMAP:
+		return "smmu_unmap";
+	case HTT_RX_RING_SLOT_EVENT_DETACH_UNMAP:
+		return "detach_unmap";
+	case HTT_RX_RING_SLOT_EVENT_DETACH_FREE:
+		return "detach_free";
+	case HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_UNMAP:
+		return "hash_deinit_unmap";
+	case HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_FREE:
+		return "hash_deinit_free";
+	default:
+		return "unknown";
+	}
+}
+
+static void
+htt_rx_ring_diag_capture_locked(struct htt_pdev_t *pdev,
+				struct htt_rx_ring_gen_info *entry,
+				uint8_t reason, unsigned long caller)
+{
+	qdf_dma_addr_t ring_end_paddr = pdev->rx_ring.base_paddr;
+	qdf_dma_addr_t target_idx_paddr = 0;
+	size_t ring_span = 0;
+
+	qdf_mem_zero(entry, sizeof(*entry));
+
+	ring_span = pdev->rx_ring.size * sizeof(target_paddr_t);
+	if (ring_span)
+		ring_end_paddr = pdev->rx_ring.base_paddr + ring_span - 1;
+
+	if (pdev->cfg.is_full_reorder_offload)
+		target_idx_paddr = pdev->rx_ring.target_idx.paddr;
+
+	entry->ts_ns = ktime_get_mono_fast_ns();
+	entry->base_paddr = pdev->rx_ring.base_paddr;
+	entry->end_paddr = ring_end_paddr;
+	entry->alloc_idx_paddr = pdev->rx_ring.alloc_idx.paddr;
+	entry->target_idx_paddr = target_idx_paddr;
+	entry->span = ring_span;
+	entry->caller = caller;
+	entry->gen = pdev->rx_ring.diag_current_gen;
+	entry->size = pdev->rx_ring.size;
+	entry->fill_level = pdev->rx_ring.fill_level;
+	entry->fill_cnt = pdev->rx_ring.fill_cnt;
+	entry->alloc_idx = pdev->rx_ring.alloc_idx.vaddr ?
+		*pdev->rx_ring.alloc_idx.vaddr : 0;
+	entry->target_idx = pdev->cfg.is_full_reorder_offload &&
+		pdev->rx_ring.target_idx.vaddr ?
+		*pdev->rx_ring.target_idx.vaddr : 0;
+	entry->sw_rd_desc = pdev->rx_ring.sw_rd_idx.msdu_desc;
+	entry->sw_rd_payld = pdev->rx_ring.sw_rd_idx.msdu_payld;
+	entry->reason = reason;
+	entry->reorder_offload = !!pdev->cfg.is_full_reorder_offload;
+	entry->smmu_map = !!pdev->rx_ring.smmu_map;
+}
+
+static int htt_rx_ring_diag_init(struct htt_pdev_t *pdev)
+{
+	size_t slot_gen_bytes;
+	size_t slot_event_bytes;
+
+	slot_gen_bytes = pdev->rx_ring.size * sizeof(*pdev->rx_ring.diag_slot_gen);
+	slot_event_bytes = HTT_RX_RING_SLOT_EVENT_HISTORY_MAX *
+		sizeof(*pdev->rx_ring.diag_slot_events);
+
+	pdev->rx_ring.diag_slot_gen = qdf_mem_malloc(slot_gen_bytes);
+	if (!pdev->rx_ring.diag_slot_gen)
+		return -ENOMEM;
+
+	pdev->rx_ring.diag_slot_events = qdf_mem_malloc(slot_event_bytes);
+	if (!pdev->rx_ring.diag_slot_events) {
+		qdf_mem_free(pdev->rx_ring.diag_slot_gen);
+		pdev->rx_ring.diag_slot_gen = NULL;
+		return -ENOMEM;
+	}
+
+	qdf_mem_zero(pdev->rx_ring.diag_slot_gen, slot_gen_bytes);
+	qdf_mem_zero(pdev->rx_ring.diag_slot_events, slot_event_bytes);
+	qdf_mem_zero(pdev->rx_ring.diag_gen_history,
+		     sizeof(pdev->rx_ring.diag_gen_history));
+	qdf_spinlock_create(&(pdev->rx_ring.diag_lock));
+	pdev->rx_ring.diag_current_gen = 0;
+	pdev->rx_ring.diag_gen_next = 0;
+	pdev->rx_ring.diag_slot_event_next = 0;
+	pdev->rx_ring.diag_initialized = true;
+
+	return 0;
+}
+
+static void htt_rx_ring_diag_deinit(struct htt_pdev_t *pdev)
+{
+	if (!pdev->rx_ring.diag_initialized)
+		return;
+
+	qdf_spinlock_destroy(&(pdev->rx_ring.diag_lock));
+	qdf_mem_free(pdev->rx_ring.diag_slot_events);
+	qdf_mem_free(pdev->rx_ring.diag_slot_gen);
+	pdev->rx_ring.diag_slot_events = NULL;
+	pdev->rx_ring.diag_slot_gen = NULL;
+	pdev->rx_ring.diag_current_gen = 0;
+	pdev->rx_ring.diag_gen_next = 0;
+	pdev->rx_ring.diag_slot_event_next = 0;
+	pdev->rx_ring.diag_initialized = false;
+	qdf_mem_zero(pdev->rx_ring.diag_gen_history,
+		     sizeof(pdev->rx_ring.diag_gen_history));
+}
+
+void htt_rx_ring_diag_gen_advance(struct htt_pdev_t *pdev, uint8_t reason,
+				  unsigned long caller)
+{
+	struct htt_rx_ring_gen_info *entry;
+
+	if (!pdev->rx_ring.diag_initialized)
+		return;
+
+	qdf_spin_lock_bh(&(pdev->rx_ring.diag_lock));
+	pdev->rx_ring.diag_current_gen++;
+	entry = &pdev->rx_ring.diag_gen_history[pdev->rx_ring.diag_gen_next];
+	htt_rx_ring_diag_capture_locked(pdev, entry, reason, caller);
+	pdev->rx_ring.diag_gen_next++;
+	if (pdev->rx_ring.diag_gen_next >= HTT_RX_RING_GEN_HISTORY_MAX)
+		pdev->rx_ring.diag_gen_next = 0;
+	qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
+}
+
+void htt_rx_ring_diag_gen_update_current(struct htt_pdev_t *pdev,
+					 unsigned long caller)
+{
+	struct htt_rx_ring_gen_info *entry;
+	uint8_t reason;
+	unsigned long saved_caller;
+	u64 saved_ts_ns;
+	uint32_t idx;
+
+	if (!pdev->rx_ring.diag_initialized || !pdev->rx_ring.diag_current_gen)
+		return;
+
+	qdf_spin_lock_bh(&(pdev->rx_ring.diag_lock));
+	idx = pdev->rx_ring.diag_gen_next ?
+		pdev->rx_ring.diag_gen_next - 1 :
+		HTT_RX_RING_GEN_HISTORY_MAX - 1;
+	entry = &pdev->rx_ring.diag_gen_history[idx];
+	if (entry->gen != pdev->rx_ring.diag_current_gen) {
+		qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
+		return;
+	}
+
+	reason = entry->reason;
+	saved_caller = entry->caller;
+	saved_ts_ns = entry->ts_ns;
+	htt_rx_ring_diag_capture_locked(pdev, entry, reason,
+					caller ? caller : saved_caller);
+	entry->ts_ns = saved_ts_ns;
+	qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
+}
+
+static void
+htt_rx_ring_diag_record_slot_event(struct htt_pdev_t *pdev, uint16_t slot_idx,
+				   uint8_t event, qdf_dma_addr_t paddr,
+				   qdf_nbuf_t netbuf, uint32_t gen,
+				   unsigned long caller)
+{
+	struct htt_rx_ring_slot_event *entry;
+
+	if (!pdev->rx_ring.diag_initialized || !pdev->rx_ring.diag_slot_events ||
+	    slot_idx >= pdev->rx_ring.size)
+		return;
+
+	if (!gen)
+		gen = pdev->rx_ring.diag_current_gen;
+
+	qdf_spin_lock_bh(&(pdev->rx_ring.diag_lock));
+	entry = &pdev->rx_ring.diag_slot_events[pdev->rx_ring.diag_slot_event_next];
+	qdf_mem_zero(entry, sizeof(*entry));
+	entry->ts_ns = ktime_get_mono_fast_ns();
+	entry->paddr = paddr;
+	entry->netbuf = netbuf;
+	entry->caller = caller;
+	entry->gen = gen;
+	entry->slot_idx = slot_idx;
+	entry->event = event;
+	pdev->rx_ring.diag_slot_event_next++;
+	if (pdev->rx_ring.diag_slot_event_next >=
+	    HTT_RX_RING_SLOT_EVENT_HISTORY_MAX)
+		pdev->rx_ring.diag_slot_event_next = 0;
+	qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
+}
+
+static void
+htt_rx_ring_diag_dump_slot_history(struct htt_pdev_t *pdev, uint16_t slot_idx)
+{
+	struct htt_rx_ring_slot_event matches[HTT_RX_RING_SLOT_DUMP_COUNT];
+	uint32_t next;
+	int i, found = 0;
+
+	if (!pdev->rx_ring.diag_initialized || !pdev->rx_ring.diag_slot_events)
+		return;
+
+	qdf_spin_lock_bh(&(pdev->rx_ring.diag_lock));
+	next = pdev->rx_ring.diag_slot_event_next;
+	for (i = 0; i < HTT_RX_RING_SLOT_EVENT_HISTORY_MAX &&
+	     found < HTT_RX_RING_SLOT_DUMP_COUNT; i++) {
+		uint32_t idx;
+		struct htt_rx_ring_slot_event *entry;
+
+		idx = next + HTT_RX_RING_SLOT_EVENT_HISTORY_MAX - 1 - i;
+		if (idx >= HTT_RX_RING_SLOT_EVENT_HISTORY_MAX)
+			idx -= HTT_RX_RING_SLOT_EVENT_HISTORY_MAX;
+
+		entry = &pdev->rx_ring.diag_slot_events[idx];
+		if (!entry->ts_ns || entry->slot_idx != slot_idx)
+			continue;
+
+		matches[found++] = *entry;
+	}
+	qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
+
+	if (!found) {
+		qdf_print("HTT RX ring diag: slot=%u has no retained slot history\n",
+			  slot_idx);
+		return;
+	}
+
+	for (i = 0; i < found; i++) {
+		struct htt_rx_ring_slot_event *entry = &matches[i];
+
+		qdf_print("HTT RX ring slot[%u] hist[%d]: ts=%lluns gen=%u event=%s paddr=%pad netbuf=%pK caller=%pS\n",
+			  slot_idx, i, (unsigned long long)entry->ts_ns,
+			  entry->gen,
+			  htt_rx_ring_slot_event_to_string(entry->event),
+			  &entry->paddr, entry->netbuf,
+			  (void *)entry->caller);
+	}
+}
+
+void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
+				    unsigned long iova)
+{
+	struct htt_rx_ring_gen_info history[HTT_RX_RING_GEN_HISTORY_MAX];
+	uint32_t current_gen;
+	uint32_t gen_next;
+	size_t elem_size = sizeof(target_paddr_t);
+	bool current_ring_hit = false, previous_ring_hit = false;
+	bool current_shadow_hit = false, previous_shadow_hit = false;
+	bool dump_slot_history = false;
+	uint16_t dump_slot_idx = 0;
+	uint32_t dump_slot_gen = 0;
+	int i;
+
+	if (!pdev || !pdev->rx_ring.diag_initialized)
+		return;
+
+	qdf_spin_lock_bh(&(pdev->rx_ring.diag_lock));
+	qdf_mem_copy(history, pdev->rx_ring.diag_gen_history, sizeof(history));
+	current_gen = pdev->rx_ring.diag_current_gen;
+	gen_next = pdev->rx_ring.diag_gen_next;
+	qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
+
+	qdf_print("HTT RX ring diag: iova=0x%lx current_gen=%u live_base=%pad live_alloc_idx_paddr=%pad live_target_idx_paddr=%pad live_fill_cnt=%d live_fill_level=%d live_sw_rd_desc=%u live_sw_rd_payld=%u\n",
+		  iova, current_gen, &pdev->rx_ring.base_paddr,
+		  &pdev->rx_ring.alloc_idx.paddr, &pdev->rx_ring.target_idx.paddr,
+		  pdev->rx_ring.fill_cnt, pdev->rx_ring.fill_level,
+		  pdev->rx_ring.sw_rd_idx.msdu_desc,
+		  pdev->rx_ring.sw_rd_idx.msdu_payld);
+
+	for (i = 0; i < HTT_RX_RING_GEN_HISTORY_MAX; i++) {
+		uint32_t idx = gen_next + HTT_RX_RING_GEN_HISTORY_MAX - 1 - i;
+		struct htt_rx_ring_gen_info *entry;
+		bool ring_hit = false;
+		bool alloc_shadow_hit = false;
+		bool target_shadow_hit = false;
+		bool is_current;
+		u64 offset = 0;
+		u64 slot = 0;
+		u32 elem_offset = 0;
+
+		if (idx >= HTT_RX_RING_GEN_HISTORY_MAX)
+			idx -= HTT_RX_RING_GEN_HISTORY_MAX;
+
+		entry = &history[idx];
+		if (!entry->gen)
+			continue;
+
+		if (entry->span &&
+		    iova >= (unsigned long)entry->base_paddr &&
+		    iova <= (unsigned long)entry->end_paddr)
+			ring_hit = true;
+
+		if (entry->alloc_idx_paddr &&
+		    iova >= (unsigned long)entry->alloc_idx_paddr &&
+		    iova < (unsigned long)entry->alloc_idx_paddr +
+		    sizeof(uint32_t))
+			alloc_shadow_hit = true;
+
+		if (entry->target_idx_paddr &&
+		    iova >= (unsigned long)entry->target_idx_paddr &&
+		    iova < (unsigned long)entry->target_idx_paddr +
+		    sizeof(uint32_t))
+			target_shadow_hit = true;
+
+		if (!ring_hit && !alloc_shadow_hit && !target_shadow_hit)
+			continue;
+
+		is_current = entry->gen == current_gen;
+		if (ring_hit) {
+			offset = iova - (u64)entry->base_paddr;
+			slot = offset / elem_size;
+			elem_offset = offset % elem_size;
+		}
+
+		qdf_print("HTT RX ring gen[%u]%s: ts=%lluns reason=%s base=%pad end=%pad span=0x%zx entries=%u fill_level=%u fill_cnt=%u alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%u smmu_map=%u ring_hit=%d alloc_shadow_hit=%d target_shadow_hit=%d caller=%pS\n",
+			  entry->gen, is_current ? " current" : "",
+			  (unsigned long long)entry->ts_ns,
+			  htt_rx_ring_gen_reason_to_string(entry->reason),
+			  &entry->base_paddr, &entry->end_paddr, entry->span,
+			  entry->size, entry->fill_level, entry->fill_cnt,
+			  &entry->alloc_idx_paddr, entry->alloc_idx,
+			  &entry->target_idx_paddr, entry->target_idx,
+			  entry->reorder_offload, entry->smmu_map, ring_hit,
+			  alloc_shadow_hit, target_shadow_hit,
+			  (void *)entry->caller);
+
+		if (ring_hit)
+			qdf_print("HTT RX ring gen[%u]: iova=0x%lx maps to slot=%llu offset=0x%llx elem_offset=0x%x\n",
+				  entry->gen, iova, (unsigned long long)slot,
+				  (unsigned long long)offset, elem_offset);
+
+		if (is_current) {
+			current_ring_hit |= ring_hit;
+			current_shadow_hit |= alloc_shadow_hit ||
+				target_shadow_hit;
+		} else {
+			previous_ring_hit |= ring_hit;
+			previous_shadow_hit |= alloc_shadow_hit ||
+				target_shadow_hit;
+		}
+
+		if (ring_hit && ((!dump_slot_history && is_current) ||
+		    (!dump_slot_history && !current_ring_hit) ||
+		    (is_current && dump_slot_gen != current_gen))) {
+			dump_slot_history = true;
+			dump_slot_idx = (uint16_t)slot;
+			dump_slot_gen = entry->gen;
+		}
+	}
+
+	qdf_print("HTT RX ring diag classification: current_ring_hit=%d previous_ring_hit=%d current_shadow_hit=%d previous_shadow_hit=%d reused_across_generations=%d\n",
+		  current_ring_hit, previous_ring_hit, current_shadow_hit,
+		  previous_shadow_hit,
+		  (current_ring_hit || current_shadow_hit) &&
+		  (previous_ring_hit || previous_shadow_hit));
+
+	if (!current_ring_hit && !previous_ring_hit &&
+	    !current_shadow_hit && !previous_shadow_hit)
+		qdf_print("HTT RX ring diag: iova=0x%lx hit no retained RX ring generation\n",
+			  iova);
+
+	if (dump_slot_history) {
+		qdf_print("HTT RX ring diag: dumping slot history for slot=%u preferred_gen=%u\n",
+			  dump_slot_idx, dump_slot_gen);
+		htt_rx_ring_diag_dump_slot_history(pdev, dump_slot_idx);
+	}
+}
+
 /**
  * htt_get_first_packet_after_wow_wakeup() - get first packet after wow wakeup
  * @msg_word: pointer to rx indication message word
@@ -171,6 +563,14 @@ static void htt_rx_hash_deinit(struct htt_pdev_t *pdev)
 							     pdev->rx_ring.
 							     listnode_offset);
 			if (hash_entry->netbuf) {
+				htt_rx_ring_diag_record_slot_event(
+					pdev, hash_entry->slot_idx,
+					HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_UNMAP,
+					hash_entry->slot_idx < pdev->rx_ring.size ?
+					pdev->rx_ring.buf.paddrs_ring[
+						hash_entry->slot_idx] : 0,
+					hash_entry->netbuf,
+					hash_entry->gen, _RET_IP_);
 				if (ipa_smmu) {
 					qdf_update_mem_map_table(pdev->osdev,
 						&mem_map_table,
@@ -188,6 +588,18 @@ static void htt_rx_hash_deinit(struct htt_pdev_t *pdev)
 				qdf_nbuf_unmap(pdev->osdev, hash_entry->netbuf,
 					       QDF_DMA_FROM_DEVICE);
 #endif
+				htt_rx_ring_diag_record_slot_event(
+					pdev, hash_entry->slot_idx,
+					HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_FREE,
+					hash_entry->slot_idx < pdev->rx_ring.size ?
+					pdev->rx_ring.buf.paddrs_ring[
+						hash_entry->slot_idx] : 0,
+					hash_entry->netbuf,
+					hash_entry->gen, _RET_IP_);
+				if (hash_entry->slot_idx < pdev->rx_ring.size &&
+				    pdev->rx_ring.diag_slot_gen)
+					pdev->rx_ring.diag_slot_gen[
+						hash_entry->slot_idx] = 0;
 				qdf_nbuf_free(hash_entry->netbuf);
 				hash_entry->paddr = 0;
 			}
@@ -578,7 +990,8 @@ moretofill:
 		paddr_marked = htt_rx_paddr_mark_high_bits(paddr);
 		if (pdev->cfg.is_full_reorder_offload) {
 			if (qdf_unlikely(htt_rx_hash_list_insert(
-					pdev, paddr_marked, rx_netbuf))) {
+					pdev, paddr_marked, rx_netbuf, idx,
+					pdev->rx_ring.diag_current_gen))) {
 				QDF_TRACE(QDF_MODULE_ID_HTT,
 					  QDF_TRACE_LEVEL_ERROR,
 					  "%s: hash insert failed!", __func__);
@@ -604,6 +1017,12 @@ moretofill:
 		}
 
 		pdev->rx_ring.buf.paddrs_ring[idx] = paddr_marked;
+		if (pdev->rx_ring.diag_slot_gen)
+			pdev->rx_ring.diag_slot_gen[idx] =
+				pdev->rx_ring.diag_current_gen;
+		htt_rx_ring_diag_record_slot_event(
+			pdev, idx, HTT_RX_RING_SLOT_EVENT_FILL, paddr_marked,
+			rx_netbuf, pdev->rx_ring.diag_current_gen, _RET_IP_);
 		pdev->rx_ring.fill_cnt++;
 
 		num--;
@@ -745,6 +1164,9 @@ void htt_rx_detach(struct htt_pdev_t *pdev)
 	    pdev->rx_ring.smmu_map)
 		ipa_smmu = true;
 
+	htt_rx_ring_diag_gen_advance(pdev, HTT_RX_RING_GEN_REASON_DETACH,
+				     _RET_IP_);
+
 	if (ring_span)
 		ring_end_paddr = pdev->rx_ring.base_paddr + ring_span - 1;
 
@@ -757,8 +1179,9 @@ void htt_rx_detach(struct htt_pdev_t *pdev)
 			target_idx = *pdev->rx_ring.target_idx.vaddr;
 	}
 
-	qdf_print("HTT RX ring detach: base=%pad end=%pad span=0x%zx elem_size=%zu entries=%d fill_level=%d fill_cnt=%d refill_debt=%d alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%d sw_rd_desc=%u sw_rd_payld=%u ipa_smmu=%d\n",
-		  &pdev->rx_ring.base_paddr, &ring_end_paddr, ring_span,
+	qdf_print("HTT RX ring detach: gen=%u base=%pad end=%pad span=0x%zx elem_size=%zu entries=%d fill_level=%d fill_cnt=%d refill_debt=%d alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%d sw_rd_desc=%u sw_rd_payld=%u ipa_smmu=%d\n",
+		  pdev->rx_ring.diag_current_gen, &pdev->rx_ring.base_paddr,
+		  &ring_end_paddr, ring_span,
 		  sizeof(target_paddr_t), pdev->rx_ring.size,
 		  pdev->rx_ring.fill_level, pdev->rx_ring.fill_cnt,
 		  qdf_atomic_read(&pdev->rx_ring.refill_debt),
@@ -787,6 +1210,13 @@ void htt_rx_detach(struct htt_pdev_t *pdev)
 		qdf_mem_info_t mem_map_table = {0};
 
 		while (sw_rd_idx != *(pdev->rx_ring.alloc_idx.vaddr)) {
+			htt_rx_ring_diag_record_slot_event(
+				pdev, sw_rd_idx, HTT_RX_RING_SLOT_EVENT_DETACH_UNMAP,
+				pdev->rx_ring.buf.paddrs_ring[sw_rd_idx],
+				pdev->rx_ring.buf.netbufs_ring[sw_rd_idx],
+				pdev->rx_ring.diag_slot_gen ?
+				pdev->rx_ring.diag_slot_gen[sw_rd_idx] : 0,
+				_RET_IP_);
 			if (ipa_smmu) {
 				qdf_update_mem_map_table(pdev->osdev,
 					&mem_map_table,
@@ -808,6 +1238,15 @@ void htt_rx_detach(struct htt_pdev_t *pdev)
 				       netbufs_ring[sw_rd_idx],
 				       QDF_DMA_FROM_DEVICE);
 #endif
+			htt_rx_ring_diag_record_slot_event(
+				pdev, sw_rd_idx, HTT_RX_RING_SLOT_EVENT_DETACH_FREE,
+				pdev->rx_ring.buf.paddrs_ring[sw_rd_idx],
+				pdev->rx_ring.buf.netbufs_ring[sw_rd_idx],
+				pdev->rx_ring.diag_slot_gen ?
+				pdev->rx_ring.diag_slot_gen[sw_rd_idx] : 0,
+				_RET_IP_);
+			if (pdev->rx_ring.diag_slot_gen)
+				pdev->rx_ring.diag_slot_gen[sw_rd_idx] = 0;
 			qdf_nbuf_free(pdev->rx_ring.buf.
 				      netbufs_ring[sw_rd_idx]);
 			sw_rd_idx++;
@@ -834,6 +1273,7 @@ void htt_rx_detach(struct htt_pdev_t *pdev)
 
 	/* destroy the rx-parallelization refill spinlock */
 	qdf_spinlock_destroy(&(pdev->rx_ring.refill_lock));
+	htt_rx_ring_diag_deinit(pdev);
 }
 
 /*--- rx descriptor field access functions ----------------------------------*/
@@ -1086,6 +1526,13 @@ static inline qdf_nbuf_t htt_rx_netbuf_pop(htt_pdev_handle pdev)
 
 	idx = pdev->rx_ring.sw_rd_idx.msdu_payld;
 	msdu = pdev->rx_ring.buf.netbufs_ring[idx];
+	htt_rx_ring_diag_record_slot_event(
+		pdev, idx, HTT_RX_RING_SLOT_EVENT_POP,
+		pdev->rx_ring.buf.paddrs_ring[idx], msdu,
+		pdev->rx_ring.diag_slot_gen ? pdev->rx_ring.diag_slot_gen[idx] : 0,
+		_RET_IP_);
+	if (pdev->rx_ring.diag_slot_gen)
+		pdev->rx_ring.diag_slot_gen[idx] = 0;
 	idx++;
 	idx &= pdev->rx_ring.size_mask;
 	pdev->rx_ring.sw_rd_idx.msdu_payld = idx;
@@ -3433,7 +3880,8 @@ static inline void htt_list_remove(struct htt_list_node *node)
 int
 htt_rx_hash_list_insert(struct htt_pdev_t *pdev,
 			qdf_dma_addr_t paddr,
-			qdf_nbuf_t netbuf)
+			qdf_nbuf_t netbuf, uint16_t slot_idx,
+			uint32_t gen)
 {
 	int i;
 	int rc = 0;
@@ -3474,6 +3922,8 @@ htt_rx_hash_list_insert(struct htt_pdev_t *pdev,
 
 	hash_element->netbuf = netbuf;
 	hash_element->paddr = paddr;
+	hash_element->slot_idx = slot_idx;
+	hash_element->gen = gen;
 	HTT_RX_HASH_COOKIE_SET(hash_element);
 
 	htt_list_add_tail(&pdev->rx_ring.hash_table[i]->listhead,
@@ -3520,6 +3970,9 @@ qdf_nbuf_t htt_rx_hash_list_lookup(struct htt_pdev_t *pdev,
 		HTT_RX_HASH_COOKIE_CHECK(hash_entry);
 
 		if (hash_entry->paddr == paddr) {
+			uint16_t slot_idx = hash_entry->slot_idx;
+			uint32_t gen = hash_entry->gen;
+
 			/* Found the entry corresponding to paddr */
 			netbuf = hash_entry->netbuf;
 			/* set netbuf to NULL to trace if freed entry
@@ -3539,6 +3992,16 @@ qdf_nbuf_t htt_rx_hash_list_lookup(struct htt_pdev_t *pdev,
 			else
 				qdf_mem_free(hash_entry);
 
+			htt_rx_ring_diag_record_slot_event(
+				pdev, slot_idx,
+				HTT_RX_RING_SLOT_EVENT_HASH_POP,
+				slot_idx < pdev->rx_ring.size ?
+				pdev->rx_ring.buf.paddrs_ring[slot_idx] :
+				0,
+				netbuf, gen, _RET_IP_);
+			if (slot_idx < pdev->rx_ring.size &&
+			    pdev->rx_ring.diag_slot_gen)
+				pdev->rx_ring.diag_slot_gen[slot_idx] = 0;
 			htt_rx_dbg_rxbuf_reset(pdev, netbuf);
 			break;
 		}
@@ -3719,6 +4182,9 @@ int htt_rx_attach(struct htt_pdev_t *pdev)
 	 */
 	pdev->rx_ring.fill_level = htt_rx_ring_fill_level(pdev);
 
+	if (htt_rx_ring_diag_init(pdev))
+		goto fail1;
+
 	if (pdev->cfg.is_full_reorder_offload) {
 		if (htt_rx_hash_init(pdev))
 			goto fail1;
@@ -3793,8 +4259,11 @@ int htt_rx_attach(struct htt_pdev_t *pdev)
 	pdev->rx_ring.rx_reset = 0;
 	pdev->rx_ring.htt_rx_restore = 0;
 #endif
+	htt_rx_ring_diag_gen_advance(pdev, HTT_RX_RING_GEN_REASON_ATTACH,
+				     _RET_IP_);
 	htt_rx_dbg_rxbuf_init(pdev);
 	htt_rx_ring_fill_n(pdev, pdev->rx_ring.fill_level);
+	htt_rx_ring_diag_gen_update_current(pdev, 0);
 
 	if (pdev->cfg.is_full_reorder_offload) {
 		QDF_TRACE(QDF_MODULE_ID_HTT, QDF_TRACE_LEVEL_INFO,
@@ -3833,8 +4302,9 @@ int htt_rx_attach(struct htt_pdev_t *pdev)
 	if (pdev->cfg.is_full_reorder_offload)
 		target_idx_paddr = pdev->rx_ring.target_idx.paddr;
 
-	qdf_print("HTT RX ring attach: base=%pad end=%pad span=0x%zx elem_size=%u entries=%d fill_level=%d fill_cnt=%d refill_debt=%d alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%d sw_rd_desc=%u sw_rd_payld=%u\n",
-		  &pdev->rx_ring.base_paddr, &ring_end_paddr,
+	qdf_print("HTT RX ring attach: gen=%u base=%pad end=%pad span=0x%zx elem_size=%u entries=%d fill_level=%d fill_cnt=%d refill_debt=%d alloc_idx_paddr=%pad alloc_idx=%u target_idx_paddr=%pad target_idx=%u reorder_offload=%d sw_rd_desc=%u sw_rd_payld=%u\n",
+		  pdev->rx_ring.diag_current_gen, &pdev->rx_ring.base_paddr,
+		  &ring_end_paddr,
 		  ring_span, ring_elem_size,
 		  pdev->rx_ring.size, pdev->rx_ring.fill_level,
 		  pdev->rx_ring.fill_cnt,
@@ -3878,6 +4348,7 @@ fail2:
 		htt_rx_hash_deinit(pdev);
 
 fail1:
+	htt_rx_ring_diag_deinit(pdev);
 	return 1;               /* failure */
 }
 #endif
@@ -4032,6 +4503,15 @@ static int htt_rx_hash_smmu_map(bool map, struct htt_pdev_t *pdev)
 							     pdev->rx_ring.
 							     listnode_offset);
 			if (hash_entry->netbuf) {
+				htt_rx_ring_diag_record_slot_event(
+					pdev, hash_entry->slot_idx,
+					map ? HTT_RX_RING_SLOT_EVENT_SMMU_MAP :
+					HTT_RX_RING_SLOT_EVENT_SMMU_UNMAP,
+					hash_entry->slot_idx < pdev->rx_ring.size ?
+					pdev->rx_ring.buf.paddrs_ring[
+						hash_entry->slot_idx] : 0,
+					hash_entry->netbuf, hash_entry->gen,
+					_RET_IP_);
 				qdf_update_mem_map_table(pdev->osdev,
 						&mem_map_table,
 						QDF_NBUF_CB_PADDR(

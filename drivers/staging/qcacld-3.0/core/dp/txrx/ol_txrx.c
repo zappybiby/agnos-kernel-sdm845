@@ -6071,29 +6071,6 @@ void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova)
 {
 	struct ol_txrx_pdev_t *pdev = cds_get_context(QDF_MODULE_ID_TXRX);
 	struct htt_pdev_t *htt_pdev;
-	qdf_dma_addr_t base_paddr;
-	qdf_dma_addr_t alloc_idx_paddr;
-	qdf_dma_addr_t target_idx_paddr;
-	qdf_dma_addr_t ring_end_paddr = 0;
-	u64 fault_iova = iova;
-	u64 ring_base;
-	u64 ring_span;
-	u64 ring_end = 0;
-	u64 offset;
-	u64 slot;
-	uint32_t elem_size = sizeof(target_paddr_t);
-	uint32_t elem_offset;
-	uint32_t shadow_size = sizeof(uint32_t);
-	int ring_size;
-	int fill_level;
-	int fill_cnt;
-	int refill_debt;
-	unsigned int sw_rd_desc;
-	unsigned int sw_rd_payld;
-	bool reorder_offload;
-	bool ring_hit;
-	bool alloc_shadow_hit;
-	bool target_shadow_hit = false;
 
 	if (!pdev) {
 		qdf_print("HTT RX ring diag: iova=0x%lx txrx pdev unavailable\n",
@@ -6107,54 +6084,7 @@ void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova)
 			  iova);
 		return;
 	}
-
-	base_paddr = htt_pdev->rx_ring.base_paddr;
-	ring_end_paddr = base_paddr;
-	alloc_idx_paddr = htt_pdev->rx_ring.alloc_idx.paddr;
-	reorder_offload = !!htt_pdev->cfg.is_full_reorder_offload;
-	target_idx_paddr = reorder_offload ?
-		htt_pdev->rx_ring.target_idx.paddr : 0;
-	ring_size = htt_pdev->rx_ring.size;
-	fill_level = htt_pdev->rx_ring.fill_level;
-	fill_cnt = htt_pdev->rx_ring.fill_cnt;
-	refill_debt = qdf_atomic_read(&htt_pdev->rx_ring.refill_debt);
-	sw_rd_desc = htt_pdev->rx_ring.sw_rd_idx.msdu_desc;
-	sw_rd_payld = htt_pdev->rx_ring.sw_rd_idx.msdu_payld;
-
-	ring_base = base_paddr;
-	ring_span = ring_size > 0 ? (u64)ring_size * elem_size : 0;
-	if (ring_span) {
-		ring_end = ring_base + ring_span - 1;
-		if (ring_end < ring_base)
-			ring_end = ~0ULL;
-		ring_end_paddr = ring_end;
-	}
-
-	ring_hit = ring_span && fault_iova >= ring_base && fault_iova <= ring_end;
-	alloc_shadow_hit = alloc_idx_paddr &&
-		fault_iova >= (u64)alloc_idx_paddr &&
-		fault_iova < (u64)alloc_idx_paddr + shadow_size;
-	if (reorder_offload && target_idx_paddr)
-		target_shadow_hit = fault_iova >= (u64)target_idx_paddr &&
-			fault_iova < (u64)target_idx_paddr + shadow_size;
-
-	qdf_print("HTT RX ring diag: iova=0x%lx base=%pad end=%pad span=0x%llx elem_size=%u entries=%d fill_level=%d fill_cnt=%d refill_debt=%d sw_rd_desc=%u sw_rd_payld=%u alloc_idx_paddr=%pad target_idx_paddr=%pad reorder_offload=%d ring_hit=%d alloc_shadow_hit=%d target_shadow_hit=%d\n",
-		  iova, &base_paddr, &ring_end_paddr,
-		  (unsigned long long)ring_span, elem_size, ring_size,
-		  fill_level, fill_cnt, refill_debt, sw_rd_desc, sw_rd_payld,
-		  &alloc_idx_paddr, &target_idx_paddr, reorder_offload,
-		  ring_hit, alloc_shadow_hit, target_shadow_hit);
-
-	if (!ring_hit)
-		return;
-
-	offset = fault_iova - ring_base;
-	slot = offset / elem_size;
-	elem_offset = offset % elem_size;
-
-	qdf_print("HTT RX ring diag: iova=0x%lx maps to rx_ring slot=%llu offset=0x%llx elem_offset=0x%x\n",
-		  iova, (unsigned long long)slot,
-		  (unsigned long long)offset, elem_offset);
+	htt_rx_ring_diag_dump_for_iova(htt_pdev, iova);
 }
 EXPORT_SYMBOL(ol_txrx_dump_htt_rx_ring_for_iova);
 

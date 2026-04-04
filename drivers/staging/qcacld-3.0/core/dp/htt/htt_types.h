@@ -96,6 +96,8 @@ struct htt_list_node {
 struct htt_rx_hash_entry {
 	qdf_dma_addr_t paddr;
 	qdf_nbuf_t netbuf;
+	uint16_t slot_idx;
+	uint32_t gen;
 	A_UINT8 fromlist;
 	struct htt_list_node listnode;
 #ifdef RX_HASH_DEBUG
@@ -110,6 +112,40 @@ struct htt_rx_hash_bucket {
 #ifdef RX_HASH_DEBUG
 	A_UINT32 count;
 #endif
+};
+
+#define HTT_RX_RING_GEN_HISTORY_MAX 16
+#define HTT_RX_RING_SLOT_EVENT_HISTORY_MAX 4096
+
+struct htt_rx_ring_gen_info {
+	u64 ts_ns;
+	qdf_dma_addr_t base_paddr;
+	qdf_dma_addr_t end_paddr;
+	qdf_dma_addr_t alloc_idx_paddr;
+	qdf_dma_addr_t target_idx_paddr;
+	size_t span;
+	unsigned long caller;
+	uint32_t gen;
+	uint32_t size;
+	uint32_t fill_level;
+	uint32_t fill_cnt;
+	uint32_t alloc_idx;
+	uint32_t target_idx;
+	uint32_t sw_rd_desc;
+	uint32_t sw_rd_payld;
+	uint8_t reason;
+	uint8_t reorder_offload;
+	uint8_t smmu_map;
+};
+
+struct htt_rx_ring_slot_event {
+	u64 ts_ns;
+	qdf_dma_addr_t paddr;
+	qdf_nbuf_t netbuf;
+	unsigned long caller;
+	uint32_t gen;
+	uint16_t slot_idx;
+	uint8_t event;
 };
 
 /*
@@ -361,6 +397,15 @@ struct htt_pdev_t {
 		uint32_t listnode_offset;
 
 		bool smmu_map;
+		bool diag_initialized;
+		qdf_spinlock_t diag_lock;
+		uint32_t diag_current_gen;
+		uint32_t diag_gen_next;
+		uint32_t diag_slot_event_next;
+		uint32_t *diag_slot_gen;
+		struct htt_rx_ring_slot_event *diag_slot_events;
+		struct htt_rx_ring_gen_info
+			diag_gen_history[HTT_RX_RING_GEN_HISTORY_MAX];
 	} rx_ring;
 #ifdef CONFIG_HL_SUPPORT
 	int rx_desc_size_hl;
