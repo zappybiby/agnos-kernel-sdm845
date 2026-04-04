@@ -122,6 +122,19 @@
 
 #define HTT_RX_RING_SLOT_DUMP_COUNT 8
 
+struct htt_rx_ring_diag_eval {
+	struct htt_rx_ring_gen_info history[HTT_RX_RING_GEN_HISTORY_MAX];
+	uint32_t current_gen;
+	uint32_t gen_next;
+	bool current_ring_hit;
+	bool previous_ring_hit;
+	bool current_shadow_hit;
+	bool previous_shadow_hit;
+	bool dump_slot_history;
+	uint16_t dump_slot_idx;
+	uint32_t dump_slot_gen;
+};
+
 static const char *htt_rx_ring_gen_reason_to_string(uint8_t reason)
 {
 	switch (reason) {
@@ -133,6 +146,22 @@ static const char *htt_rx_ring_gen_reason_to_string(uint8_t reason)
 		return "detach";
 	default:
 		return "unknown";
+	}
+}
+
+const char *
+htt_rx_ring_diag_verdict_to_string(enum htt_rx_ring_epoch_verdict verdict)
+{
+	switch (verdict) {
+	case HTT_RX_RING_EPOCH_VERDICT_CURRENT_RING:
+		return "current-ring";
+	case HTT_RX_RING_EPOCH_VERDICT_PREVIOUS_RING:
+		return "previous-ring";
+	case HTT_RX_RING_EPOCH_VERDICT_REUSED_RANGE:
+		return "reused-range";
+	case HTT_RX_RING_EPOCH_VERDICT_NOT_RX_RING:
+	default:
+		return "not-rx-ring";
 	}
 }
 
@@ -382,51 +411,41 @@ htt_rx_ring_diag_dump_slot_history(struct htt_pdev_t *pdev, uint16_t slot_idx)
 	}
 }
 
-void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
-				    unsigned long iova)
+static enum htt_rx_ring_epoch_verdict
+htt_rx_ring_diag_eval_iova(struct htt_pdev_t *pdev, unsigned long iova,
+			   struct htt_rx_ring_diag_eval *eval)
 {
-	struct htt_rx_ring_gen_info history[HTT_RX_RING_GEN_HISTORY_MAX];
-	uint32_t current_gen;
-	uint32_t gen_next;
 	size_t elem_size = sizeof(target_paddr_t);
-	bool current_ring_hit = false, previous_ring_hit = false;
-	bool current_shadow_hit = false, previous_shadow_hit = false;
-	bool dump_slot_history = false;
-	uint16_t dump_slot_idx = 0;
-	uint32_t dump_slot_gen = 0;
 	int i;
 
+	if (!eval)
+		return HTT_RX_RING_EPOCH_VERDICT_NOT_RX_RING;
+
+	qdf_mem_zero(eval, sizeof(*eval));
+
 	if (!pdev || !pdev->rx_ring.diag_initialized)
-		return;
+		return HTT_RX_RING_EPOCH_VERDICT_NOT_RX_RING;
 
 	qdf_spin_lock_bh(&(pdev->rx_ring.diag_lock));
-	qdf_mem_copy(history, pdev->rx_ring.diag_gen_history, sizeof(history));
-	current_gen = pdev->rx_ring.diag_current_gen;
-	gen_next = pdev->rx_ring.diag_gen_next;
+	qdf_mem_copy(eval->history, pdev->rx_ring.diag_gen_history,
+		     sizeof(eval->history));
+	eval->current_gen = pdev->rx_ring.diag_current_gen;
+	eval->gen_next = pdev->rx_ring.diag_gen_next;
 	qdf_spin_unlock_bh(&(pdev->rx_ring.diag_lock));
 
-	qdf_print("HTT RX ring diag: iova=0x%lx current_gen=%u live_base=%pad live_alloc_idx_paddr=%pad live_target_idx_paddr=%pad live_fill_cnt=%d live_fill_level=%d live_sw_rd_desc=%u live_sw_rd_payld=%u\n",
-		  iova, current_gen, &pdev->rx_ring.base_paddr,
-		  &pdev->rx_ring.alloc_idx.paddr, &pdev->rx_ring.target_idx.paddr,
-		  pdev->rx_ring.fill_cnt, pdev->rx_ring.fill_level,
-		  pdev->rx_ring.sw_rd_idx.msdu_desc,
-		  pdev->rx_ring.sw_rd_idx.msdu_payld);
-
 	for (i = 0; i < HTT_RX_RING_GEN_HISTORY_MAX; i++) {
-		uint32_t idx = gen_next + HTT_RX_RING_GEN_HISTORY_MAX - 1 - i;
+		uint32_t idx = eval->gen_next + HTT_RX_RING_GEN_HISTORY_MAX -
+			1 - i;
 		struct htt_rx_ring_gen_info *entry;
 		bool ring_hit = false;
 		bool alloc_shadow_hit = false;
 		bool target_shadow_hit = false;
 		bool is_current;
-		u64 offset = 0;
-		u64 slot = 0;
-		u32 elem_offset = 0;
 
 		if (idx >= HTT_RX_RING_GEN_HISTORY_MAX)
 			idx -= HTT_RX_RING_GEN_HISTORY_MAX;
 
-		entry = &history[idx];
+		entry = &eval->history[idx];
 		if (!entry->gen)
 			continue;
 
@@ -450,7 +469,108 @@ void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
 		if (!ring_hit && !alloc_shadow_hit && !target_shadow_hit)
 			continue;
 
-		is_current = entry->gen == current_gen;
+		is_current = entry->gen == eval->current_gen;
+		if (is_current) {
+			eval->current_ring_hit |= ring_hit;
+			eval->current_shadow_hit |= alloc_shadow_hit ||
+				target_shadow_hit;
+		} else {
+			eval->previous_ring_hit |= ring_hit;
+			eval->previous_shadow_hit |= alloc_shadow_hit ||
+				target_shadow_hit;
+		}
+
+		if (ring_hit && ((!eval->dump_slot_history && is_current) ||
+		    (!eval->dump_slot_history && !eval->current_ring_hit) ||
+		    (is_current && eval->dump_slot_gen != eval->current_gen))) {
+			u64 offset = iova - (u64)entry->base_paddr;
+
+			eval->dump_slot_history = true;
+			eval->dump_slot_idx = (uint16_t)(offset / elem_size);
+			eval->dump_slot_gen = entry->gen;
+		}
+	}
+
+	if ((eval->current_ring_hit || eval->current_shadow_hit) &&
+	    (eval->previous_ring_hit || eval->previous_shadow_hit))
+		return HTT_RX_RING_EPOCH_VERDICT_REUSED_RANGE;
+
+	if (eval->previous_ring_hit || eval->previous_shadow_hit)
+		return HTT_RX_RING_EPOCH_VERDICT_PREVIOUS_RING;
+
+	if (eval->current_ring_hit || eval->current_shadow_hit)
+		return HTT_RX_RING_EPOCH_VERDICT_CURRENT_RING;
+
+	return HTT_RX_RING_EPOCH_VERDICT_NOT_RX_RING;
+}
+
+enum htt_rx_ring_epoch_verdict
+htt_rx_ring_diag_get_verdict(struct htt_pdev_t *pdev, unsigned long iova)
+{
+	struct htt_rx_ring_diag_eval eval;
+
+	return htt_rx_ring_diag_eval_iova(pdev, iova, &eval);
+}
+
+void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
+				    unsigned long iova)
+{
+	struct htt_rx_ring_diag_eval eval;
+	enum htt_rx_ring_epoch_verdict verdict;
+	size_t elem_size = sizeof(target_paddr_t);
+	int i;
+
+	verdict = htt_rx_ring_diag_eval_iova(pdev, iova, &eval);
+	if (!pdev || !pdev->rx_ring.diag_initialized)
+		return;
+
+	qdf_print("HTT RX ring diag: iova=0x%lx verdict=%s current_gen=%u live_base=%pad live_alloc_idx_paddr=%pad live_target_idx_paddr=%pad live_fill_cnt=%d live_fill_level=%d live_sw_rd_desc=%u live_sw_rd_payld=%u\n",
+		  iova, htt_rx_ring_diag_verdict_to_string(verdict),
+		  eval.current_gen, &pdev->rx_ring.base_paddr,
+		  &pdev->rx_ring.alloc_idx.paddr, &pdev->rx_ring.target_idx.paddr,
+		  pdev->rx_ring.fill_cnt, pdev->rx_ring.fill_level,
+		  pdev->rx_ring.sw_rd_idx.msdu_desc,
+		  pdev->rx_ring.sw_rd_idx.msdu_payld);
+
+	for (i = 0; i < HTT_RX_RING_GEN_HISTORY_MAX; i++) {
+		uint32_t idx = eval.gen_next + HTT_RX_RING_GEN_HISTORY_MAX - 1 - i;
+		struct htt_rx_ring_gen_info *entry;
+		bool ring_hit = false;
+		bool alloc_shadow_hit = false;
+		bool target_shadow_hit = false;
+		bool is_current;
+		u64 offset = 0;
+		u64 slot = 0;
+		u32 elem_offset = 0;
+
+		if (idx >= HTT_RX_RING_GEN_HISTORY_MAX)
+			idx -= HTT_RX_RING_GEN_HISTORY_MAX;
+
+		entry = &eval.history[idx];
+		if (!entry->gen)
+			continue;
+
+		if (entry->span &&
+		    iova >= (unsigned long)entry->base_paddr &&
+		    iova <= (unsigned long)entry->end_paddr)
+			ring_hit = true;
+
+		if (entry->alloc_idx_paddr &&
+		    iova >= (unsigned long)entry->alloc_idx_paddr &&
+		    iova < (unsigned long)entry->alloc_idx_paddr +
+		    sizeof(uint32_t))
+			alloc_shadow_hit = true;
+
+		if (entry->target_idx_paddr &&
+		    iova >= (unsigned long)entry->target_idx_paddr &&
+		    iova < (unsigned long)entry->target_idx_paddr +
+		    sizeof(uint32_t))
+			target_shadow_hit = true;
+
+		if (!ring_hit && !alloc_shadow_hit && !target_shadow_hit)
+			continue;
+
+		is_current = entry->gen == eval.current_gen;
 		if (ring_hit) {
 			offset = iova - (u64)entry->base_paddr;
 			slot = offset / elem_size;
@@ -473,41 +593,23 @@ void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
 			qdf_print("HTT RX ring gen[%u]: iova=0x%lx maps to slot=%llu offset=0x%llx elem_offset=0x%x\n",
 				  entry->gen, iova, (unsigned long long)slot,
 				  (unsigned long long)offset, elem_offset);
-
-		if (is_current) {
-			current_ring_hit |= ring_hit;
-			current_shadow_hit |= alloc_shadow_hit ||
-				target_shadow_hit;
-		} else {
-			previous_ring_hit |= ring_hit;
-			previous_shadow_hit |= alloc_shadow_hit ||
-				target_shadow_hit;
-		}
-
-		if (ring_hit && ((!dump_slot_history && is_current) ||
-		    (!dump_slot_history && !current_ring_hit) ||
-		    (is_current && dump_slot_gen != current_gen))) {
-			dump_slot_history = true;
-			dump_slot_idx = (uint16_t)slot;
-			dump_slot_gen = entry->gen;
-		}
 	}
 
-	qdf_print("HTT RX ring diag classification: current_ring_hit=%d previous_ring_hit=%d current_shadow_hit=%d previous_shadow_hit=%d reused_across_generations=%d\n",
-		  current_ring_hit, previous_ring_hit, current_shadow_hit,
-		  previous_shadow_hit,
-		  (current_ring_hit || current_shadow_hit) &&
-		  (previous_ring_hit || previous_shadow_hit));
+	qdf_print("HTT RX ring diag classification: verdict=%s current_ring_hit=%d previous_ring_hit=%d current_shadow_hit=%d previous_shadow_hit=%d reused_across_generations=%d\n",
+		  htt_rx_ring_diag_verdict_to_string(verdict),
+		  eval.current_ring_hit, eval.previous_ring_hit,
+		  eval.current_shadow_hit, eval.previous_shadow_hit,
+		  (eval.current_ring_hit || eval.current_shadow_hit) &&
+		  (eval.previous_ring_hit || eval.previous_shadow_hit));
 
-	if (!current_ring_hit && !previous_ring_hit &&
-	    !current_shadow_hit && !previous_shadow_hit)
+	if (verdict == HTT_RX_RING_EPOCH_VERDICT_NOT_RX_RING)
 		qdf_print("HTT RX ring diag: iova=0x%lx hit no retained RX ring generation\n",
 			  iova);
 
-	if (dump_slot_history) {
+	if (eval.dump_slot_history) {
 		qdf_print("HTT RX ring diag: dumping slot history for slot=%u preferred_gen=%u\n",
-			  dump_slot_idx, dump_slot_gen);
-		htt_rx_ring_diag_dump_slot_history(pdev, dump_slot_idx);
+			  eval.dump_slot_idx, eval.dump_slot_gen);
+		htt_rx_ring_diag_dump_slot_history(pdev, eval.dump_slot_idx);
 	}
 }
 

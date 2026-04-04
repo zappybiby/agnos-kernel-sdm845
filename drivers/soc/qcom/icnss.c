@@ -246,6 +246,7 @@ struct icnss_diag_alloc {
 extern void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 				  const char *reason, u64 ref_ts_ns);
 extern void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova);
+extern const char *ol_txrx_get_htt_rx_ring_epoch_verdict(unsigned long iova);
 #else
 static inline void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 					 const char *reason, u64 ref_ts_ns)
@@ -255,6 +256,13 @@ static inline void cds_dump_wlan_history(uint32_t mac_count, uint32_t dp_count,
 static inline void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova)
 {
 	(void)iova;
+}
+
+static inline const char *ol_txrx_get_htt_rx_ring_epoch_verdict(
+							unsigned long iova)
+{
+	(void)iova;
+	return "not-rx-ring";
 }
 #endif
 
@@ -872,6 +880,23 @@ void icnss_diag_dump_iova(struct device *dev, unsigned long iova)
 	ol_txrx_dump_htt_rx_ring_for_iova(iova);
 }
 EXPORT_SYMBOL(icnss_diag_dump_iova);
+
+const char *icnss_diag_get_iova_epoch_verdict(struct device *dev,
+					      unsigned long iova)
+{
+	struct icnss_priv *priv;
+
+	if (!dev)
+		return "not-rx-ring";
+
+	priv = dev_get_drvdata(dev);
+
+	if (!priv)
+		return "not-rx-ring";
+
+	return ol_txrx_get_htt_rx_ring_epoch_verdict(iova);
+}
+EXPORT_SYMBOL(icnss_diag_get_iova_epoch_verdict);
 
 static char *icnss_driver_event_to_str(enum icnss_driver_event_type type)
 {

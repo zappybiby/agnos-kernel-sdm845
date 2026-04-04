@@ -409,6 +409,13 @@ enum htt_rx_ring_slot_event_type {
 	HTT_RX_RING_SLOT_EVENT_HASH_DEINIT_FREE,
 };
 
+enum htt_rx_ring_epoch_verdict {
+	HTT_RX_RING_EPOCH_VERDICT_NOT_RX_RING = 0,
+	HTT_RX_RING_EPOCH_VERDICT_CURRENT_RING,
+	HTT_RX_RING_EPOCH_VERDICT_PREVIOUS_RING,
+	HTT_RX_RING_EPOCH_VERDICT_REUSED_RANGE,
+};
+
 #ifdef BIG_ENDIAN_HOST
 /*
  * big-endian: bytes within a 4-byte "word" are swapped:
@@ -552,6 +559,10 @@ void htt_rx_ring_diag_gen_advance(struct htt_pdev_t *pdev, uint8_t reason,
 				  unsigned long caller);
 void htt_rx_ring_diag_gen_update_current(struct htt_pdev_t *pdev,
 					 unsigned long caller);
+enum htt_rx_ring_epoch_verdict
+htt_rx_ring_diag_get_verdict(struct htt_pdev_t *pdev, unsigned long iova);
+const char *
+htt_rx_ring_diag_verdict_to_string(enum htt_rx_ring_epoch_verdict verdict);
 void htt_rx_ring_diag_dump_for_iova(struct htt_pdev_t *pdev,
 				     unsigned long iova);
 

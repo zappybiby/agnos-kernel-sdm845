@@ -6088,6 +6088,23 @@ void ol_txrx_dump_htt_rx_ring_for_iova(unsigned long iova)
 }
 EXPORT_SYMBOL(ol_txrx_dump_htt_rx_ring_for_iova);
 
+const char *ol_txrx_get_htt_rx_ring_epoch_verdict(unsigned long iova)
+{
+	struct ol_txrx_pdev_t *pdev = cds_get_context(QDF_MODULE_ID_TXRX);
+	struct htt_pdev_t *htt_pdev;
+
+	if (!pdev)
+		return "not-rx-ring";
+
+	htt_pdev = pdev->htt_pdev;
+	if (!htt_pdev)
+		return "not-rx-ring";
+
+	return htt_rx_ring_diag_verdict_to_string(
+		htt_rx_ring_diag_get_verdict(htt_pdev, iova));
+}
+EXPORT_SYMBOL(ol_txrx_get_htt_rx_ring_epoch_verdict);
+
 void ol_txrx_post_data_stall_event(
 				enum data_stall_log_event_indicator indicator,
 				enum data_stall_log_event_type data_stall_type,

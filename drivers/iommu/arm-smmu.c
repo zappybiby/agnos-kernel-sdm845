@@ -861,6 +861,8 @@ static void arm_smmu_dump_fault_context(struct iommu_domain *domain,
 	dev_err(smmu->dev,
 		"fault translation: soft=%pa hard=%pa low_offset=0x%02lx\n",
 		&phys_soft, &phys_atos, iova & 0xfff);
+	dev_err(smmu->dev, "fault epoch verdict: rx_ring=%s\n",
+		icnss_diag_get_iova_epoch_verdict(smmu_domain->dev, iova));
 
 	arm_smmu_dump_stream_mappings(smmu_domain, sid);
 	iommu_diag_dump_for_fault(smmu_domain->dev, domain, iova);
