@@ -174,6 +174,10 @@ static const char *htt_rx_ring_slot_event_to_string(uint8_t event)
 		return "pop";
 	case HTT_RX_RING_SLOT_EVENT_HASH_POP:
 		return "hash_pop";
+	case HTT_RX_RING_SLOT_EVENT_DMA_UNMAP:
+		return "dma_unmap";
+	case HTT_RX_RING_SLOT_EVENT_FREE:
+		return "free";
 	case HTT_RX_RING_SLOT_EVENT_SMMU_MAP:
 		return "smmu_map";
 	case HTT_RX_RING_SLOT_EVENT_SMMU_UNMAP:
@@ -998,6 +1002,130 @@ htt_rx_in_ord_paddr_get(uint32_t *u32p)
 #endif
 #endif /* ENABLE_DEBUG_ADDRESS_MARKING */
 
+#define HTT_RX_RING_DIAG_NBUF_SLOT_BITS 11
+#define HTT_RX_RING_DIAG_NBUF_SLOT_MASK \
+	((1U << HTT_RX_RING_DIAG_NBUF_SLOT_BITS) - 1)
+#define HTT_RX_RING_DIAG_NBUF_GEN_BITS \
+	(32 - HTT_RX_RING_DIAG_NBUF_SLOT_BITS)
+#define HTT_RX_RING_DIAG_NBUF_GEN_MASK \
+	((1U << HTT_RX_RING_DIAG_NBUF_GEN_BITS) - 1)
+
+/*
+ * Carry RX ring provenance with the nbuf after it leaves the ring so later
+ * per-buffer unmap/free paths can still point back to the original slot.
+ */
+#ifndef DEBUG_RX_RING_BUFFER
+static inline uint32_t *htt_rx_ring_diag_nbuf_meta_ref(qdf_nbuf_t netbuf)
+{
+	return &(((struct qdf_nbuf_cb *)((netbuf)->cb))->u.rx.map_index);
+}
+
+static inline void htt_rx_ring_diag_clear_nbuf_meta(qdf_nbuf_t netbuf)
+{
+	if (netbuf)
+		*htt_rx_ring_diag_nbuf_meta_ref(netbuf) = 0;
+}
+
+static inline void
+htt_rx_ring_diag_set_nbuf_meta(qdf_nbuf_t netbuf, uint16_t slot_idx,
+			       uint32_t gen)
+{
+	if (!netbuf)
+		return;
+
+	if (!gen || slot_idx > HTT_RX_RING_DIAG_NBUF_SLOT_MASK ||
+	    gen > HTT_RX_RING_DIAG_NBUF_GEN_MASK) {
+		htt_rx_ring_diag_clear_nbuf_meta(netbuf);
+		return;
+	}
+
+	*htt_rx_ring_diag_nbuf_meta_ref(netbuf) =
+		(gen << HTT_RX_RING_DIAG_NBUF_SLOT_BITS) | slot_idx;
+}
+
+static inline bool
+htt_rx_ring_diag_get_nbuf_meta(qdf_nbuf_t netbuf, uint16_t *slot_idx,
+			       uint32_t *gen)
+{
+	uint32_t meta;
+
+	if (!netbuf)
+		return false;
+
+	meta = *htt_rx_ring_diag_nbuf_meta_ref(netbuf);
+	if (!meta)
+		return false;
+
+	if (slot_idx)
+		*slot_idx = meta & HTT_RX_RING_DIAG_NBUF_SLOT_MASK;
+
+	if (gen)
+		*gen = meta >> HTT_RX_RING_DIAG_NBUF_SLOT_BITS;
+
+	return true;
+}
+
+static void
+htt_rx_ring_diag_record_nbuf_event(struct htt_pdev_t *pdev, qdf_nbuf_t netbuf,
+				   uint8_t event, unsigned long caller)
+{
+	uint16_t slot_idx;
+	uint32_t gen;
+	qdf_dma_addr_t paddr;
+
+	if (!pdev || !htt_rx_ring_diag_get_nbuf_meta(netbuf, &slot_idx, &gen))
+		return;
+
+	paddr = htt_rx_paddr_mark_high_bits(QDF_NBUF_CB_PADDR(netbuf));
+	htt_rx_ring_diag_record_slot_event(pdev, slot_idx, event, paddr,
+					   netbuf, gen, caller);
+}
+#else
+static inline void htt_rx_ring_diag_clear_nbuf_meta(qdf_nbuf_t netbuf)
+{
+	(void)netbuf;
+}
+
+static inline void
+htt_rx_ring_diag_set_nbuf_meta(qdf_nbuf_t netbuf, uint16_t slot_idx,
+			       uint32_t gen)
+{
+	(void)netbuf;
+	(void)slot_idx;
+	(void)gen;
+}
+
+static inline void
+htt_rx_ring_diag_record_nbuf_event(struct htt_pdev_t *pdev, qdf_nbuf_t netbuf,
+				   uint8_t event, unsigned long caller)
+{
+	(void)pdev;
+	(void)netbuf;
+	(void)event;
+	(void)caller;
+}
+#endif
+
+#define HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(_pdev, _netbuf) \
+	htt_rx_ring_diag_record_nbuf_event((_pdev), (_netbuf), \
+		HTT_RX_RING_SLOT_EVENT_DMA_UNMAP, _RET_IP_)
+
+#define HTT_RX_RING_DIAG_RECORD_SMMU_UNMAP(_pdev, _netbuf) \
+	htt_rx_ring_diag_record_nbuf_event((_pdev), (_netbuf), \
+		HTT_RX_RING_SLOT_EVENT_SMMU_UNMAP, _RET_IP_)
+
+#define HTT_RX_RING_DIAG_NBUF_FREE(_pdev, _netbuf) \
+	do { \
+		qdf_nbuf_t __rxdiag_nbuf = (_netbuf); \
+		if (__rxdiag_nbuf) { \
+			htt_rx_ring_diag_record_nbuf_event((_pdev), \
+				__rxdiag_nbuf, HTT_RX_RING_SLOT_EVENT_FREE, \
+				_RET_IP_); \
+			htt_rx_ring_diag_clear_nbuf_meta(__rxdiag_nbuf); \
+			qdf_nbuf_free(__rxdiag_nbuf); \
+		} \
+	} while (0)
+
 /* full_reorder_offload case: this function is called with lock held */
 static int htt_rx_ring_fill_n(struct htt_pdev_t *pdev, int num)
 {
@@ -1050,6 +1178,8 @@ moretofill:
 				HTT_RX_RING_REFILL_RETRY_TIME_MS);
 			goto update_alloc_idx;
 		}
+
+		htt_rx_ring_diag_clear_nbuf_meta(rx_netbuf);
 
 		/* Clear rx_desc attention word before posting to Rx ring */
 		rx_desc = htt_rx_desc(rx_netbuf);
@@ -1122,6 +1252,8 @@ moretofill:
 		if (pdev->rx_ring.diag_slot_gen)
 			pdev->rx_ring.diag_slot_gen[idx] =
 				pdev->rx_ring.diag_current_gen;
+		htt_rx_ring_diag_set_nbuf_meta(rx_netbuf, idx,
+					       pdev->rx_ring.diag_current_gen);
 		htt_rx_ring_diag_record_slot_event(
 			pdev, idx, HTT_RX_RING_SLOT_EVENT_FILL, paddr_marked,
 			rx_netbuf, pdev->rx_ring.diag_current_gen, _RET_IP_);
@@ -1628,6 +1760,9 @@ static inline qdf_nbuf_t htt_rx_netbuf_pop(htt_pdev_handle pdev)
 
 	idx = pdev->rx_ring.sw_rd_idx.msdu_payld;
 	msdu = pdev->rx_ring.buf.netbufs_ring[idx];
+	htt_rx_ring_diag_set_nbuf_meta(msdu, idx,
+				       pdev->rx_ring.diag_slot_gen ?
+				       pdev->rx_ring.diag_slot_gen[idx] : 0);
 	htt_rx_ring_diag_record_slot_event(
 		pdev, idx, HTT_RX_RING_SLOT_EVENT_POP,
 		pdev->rx_ring.buf.paddrs_ring[idx], msdu,
@@ -1825,8 +1960,10 @@ htt_rx_amsdu_pop_ll(htt_pdev_handle pdev,
 		 */
 		qdf_nbuf_set_pktlen(msdu, HTT_RX_BUF_SIZE);
 #ifdef DEBUG_DMA_DONE
+		HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, msdu);
 		qdf_nbuf_unmap(pdev->osdev, msdu, QDF_DMA_BIDIRECTIONAL);
 #else
+		HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, msdu);
 		qdf_nbuf_unmap(pdev->osdev, msdu, QDF_DMA_FROM_DEVICE);
 #endif
 
@@ -2200,8 +2337,10 @@ htt_rx_offload_msdu_pop_ll(htt_pdev_handle pdev,
 	htt_rx_mpdu_desc_list_next(pdev, NULL);
 	qdf_nbuf_set_pktlen(buf, HTT_RX_BUF_SIZE);
 #ifdef DEBUG_DMA_DONE
+	HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, buf);
 	qdf_nbuf_unmap(pdev->osdev, buf, QDF_DMA_BIDIRECTIONAL);
 #else
+	HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, buf);
 	qdf_nbuf_unmap(pdev->osdev, buf, QDF_DMA_FROM_DEVICE);
 #endif
 	msdu_hdr = (uint32_t *) qdf_nbuf_data(buf);
@@ -2247,8 +2386,10 @@ htt_rx_offload_paddr_msdu_pop_ll(htt_pdev_handle pdev,
 	}
 	qdf_nbuf_set_pktlen(buf, HTT_RX_BUF_SIZE);
 #ifdef DEBUG_DMA_DONE
+	HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, buf);
 	qdf_nbuf_unmap(pdev->osdev, buf, QDF_DMA_BIDIRECTIONAL);
 #else
+	HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, buf);
 	qdf_nbuf_unmap(pdev->osdev, buf, QDF_DMA_FROM_DEVICE);
 #endif
 
@@ -2315,6 +2456,7 @@ int htt_mon_rx_handle_amsdu_packet(qdf_nbuf_t msdu, htt_pdev_handle pdev,
 		msdu_info;
 	qdf_nbuf_append_ext_list(msdu, frag_nbuf, amsdu_len);
 	qdf_nbuf_set_pktlen(frag_nbuf, HTT_RX_BUF_SIZE);
+	HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, frag_nbuf);
 	qdf_nbuf_unmap(pdev->osdev, frag_nbuf, QDF_DMA_FROM_DEVICE);
 	/* For msdu's other than parent will not have htt_host_rx_desc_base */
 	len = MIN(amsdu_len, HTT_RX_BUF_SIZE);
@@ -2340,6 +2482,7 @@ int htt_mon_rx_handle_amsdu_packet(qdf_nbuf_t msdu, htt_pdev_handle pdev,
 		}
 		*frag_cnt = *frag_cnt + 1;
 		qdf_nbuf_set_pktlen(frag_nbuf, HTT_RX_BUF_SIZE);
+		HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, frag_nbuf);
 		qdf_nbuf_unmap(pdev->osdev, frag_nbuf, QDF_DMA_FROM_DEVICE);
 
 		len = MIN(amsdu_len, HTT_RX_BUF_SIZE);
@@ -2776,6 +2919,7 @@ static int htt_rx_mon_amsdu_rx_in_order_pop_ll(htt_pdev_handle pdev,
 		 * initially, so the unmap will unmap the entire buffer.
 		 */
 		qdf_nbuf_set_pktlen(msdu, HTT_RX_BUF_SIZE);
+		HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, msdu);
 		qdf_nbuf_unmap(pdev->osdev, msdu, QDF_DMA_FROM_DEVICE);
 
 		/*
@@ -2785,7 +2929,7 @@ static int htt_rx_mon_amsdu_rx_in_order_pop_ll(htt_pdev_handle pdev,
 		rx_desc = htt_rx_desc(msdu);
 		if ((unsigned int)(*(uint32_t *)&rx_desc->attention) &
 				RX_DESC_ATTN_MPDU_LEN_ERR_BIT) {
-			qdf_nbuf_free(msdu);
+			HTT_RX_RING_DIAG_NBUF_FREE(pdev, msdu);
 			last_frag = ((struct htt_rx_in_ord_paddr_ind_msdu_t *)
 			     msg_word)->msdu_info;
 			while (!last_frag) {
@@ -2801,9 +2945,10 @@ static int htt_rx_mon_amsdu_rx_in_order_pop_ll(htt_pdev_handle pdev,
 					return 0;
 				}
 				*replenish_cnt = *replenish_cnt + 1;
+				HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, msdu);
 				qdf_nbuf_unmap(pdev->osdev, msdu,
 					       QDF_DMA_FROM_DEVICE);
-				qdf_nbuf_free(msdu);
+				HTT_RX_RING_DIAG_NBUF_FREE(pdev, msdu);
 			}
 			msdu = prev;
 			goto next_pop;
@@ -2988,6 +3133,7 @@ htt_rx_amsdu_rx_in_order_pop_ll(htt_pdev_handle pdev,
 			qdf_update_mem_map_table(pdev->osdev, &mem_map_table,
 						 QDF_NBUF_CB_PADDR(msdu),
 						 HTT_RX_BUF_SIZE);
+			HTT_RX_RING_DIAG_RECORD_SMMU_UNMAP(pdev, msdu);
 			cds_smmu_map_unmap(false, 1, &mem_map_table);
 		}
 
@@ -2997,8 +3143,10 @@ htt_rx_amsdu_rx_in_order_pop_ll(htt_pdev_handle pdev,
 		 */
 		qdf_nbuf_set_pktlen(msdu, HTT_RX_BUF_SIZE);
 #ifdef DEBUG_DMA_DONE
+		HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, msdu);
 		qdf_nbuf_unmap(pdev->osdev, msdu, QDF_DMA_BIDIRECTIONAL);
 #else
+		HTT_RX_RING_DIAG_RECORD_DMA_UNMAP(pdev, msdu);
 		qdf_nbuf_unmap(pdev->osdev, msdu, QDF_DMA_FROM_DEVICE);
 #endif
 
@@ -3475,27 +3623,27 @@ mpdu_stitch_fail:
 	if (!clone_not_reqd) {
 		/* Free the head buffer */
 		if (mpdu_buf)
-			qdf_nbuf_free(mpdu_buf);
+			HTT_RX_RING_DIAG_NBUF_FREE(pdev, mpdu_buf);
 
 		/* Free the partial list */
 		while (head_frag_list_cloned) {
 			msdu = head_frag_list_cloned;
 			head_frag_list_cloned =
 				qdf_nbuf_next_ext(head_frag_list_cloned);
-			qdf_nbuf_free(msdu);
+			HTT_RX_RING_DIAG_NBUF_FREE(pdev, msdu);
 		}
 	} else {
 		/* Free the alloced head buffer */
 		if (decap_format != HW_RX_DECAP_FORMAT_RAW)
 			if (mpdu_buf)
-				qdf_nbuf_free(mpdu_buf);
+				HTT_RX_RING_DIAG_NBUF_FREE(pdev, mpdu_buf);
 
 		/* Free the orig buffers */
 		msdu = head_msdu;
 		while (msdu) {
 			msdu_orig = msdu;
 			msdu = qdf_nbuf_next(msdu);
-			qdf_nbuf_free(msdu_orig);
+			HTT_RX_RING_DIAG_NBUF_FREE(pdev, msdu_orig);
 		}
 	}
 
@@ -3814,7 +3962,7 @@ htt_rx_msdu_desc_key_id_ll(htt_pdev_handle pdev, void *mpdu_desc,
 
 void htt_rx_desc_frame_free(htt_pdev_handle htt_pdev, qdf_nbuf_t msdu)
 {
-	qdf_nbuf_free(msdu);
+	HTT_RX_RING_DIAG_NBUF_FREE(htt_pdev, msdu);
 }
 
 void htt_rx_msdu_desc_free(htt_pdev_handle htt_pdev, qdf_nbuf_t msdu)
@@ -4094,6 +4242,7 @@ qdf_nbuf_t htt_rx_hash_list_lookup(struct htt_pdev_t *pdev,
 			else
 				qdf_mem_free(hash_entry);
 
+			htt_rx_ring_diag_set_nbuf_meta(netbuf, slot_idx, gen);
 			htt_rx_ring_diag_record_slot_event(
 				pdev, slot_idx,
 				HTT_RX_RING_SLOT_EVENT_HASH_POP,
