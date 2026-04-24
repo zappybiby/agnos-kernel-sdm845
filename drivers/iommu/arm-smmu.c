@@ -47,6 +47,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <soc/qcom/scm.h>
 #include <soc/qcom/secure_buffer.h>
 #include <linux/of_platform.h>
@@ -1445,6 +1446,74 @@ static phys_addr_t arm_smmu_verify_fault(struct iommu_domain *domain,
 	return (phys == 0 ? phys_post_tlbiall : phys);
 }
 
+static uint arm_smmu_wlan_fault_panic_delay_ms = 10000;
+static atomic_t arm_smmu_wlan_fault_deferred = ATOMIC_INIT(0);
+
+void __weak wlan_ol_tx_smmu_fault_dump(unsigned long iova, u32 fsr, u32 fsynr,
+				       int cb, u32 sid)
+{
+}
+
+static void arm_smmu_wlan_fault_panic_work(struct work_struct *work)
+{
+	panic("deferred WLAN SMMU context fault");
+}
+
+static DECLARE_DELAYED_WORK(arm_smmu_wlan_fault_work,
+			    arm_smmu_wlan_fault_panic_work);
+
+module_param_named(wlan_fault_panic_delay_ms,
+		   arm_smmu_wlan_fault_panic_delay_ms, uint, 0644);
+MODULE_PARM_DESC(wlan_fault_panic_delay_ms,
+		 "Delay panic for WLAN SMMU context faults by this many ms");
+
+static bool arm_smmu_is_wlan_fault(struct arm_smmu_device *smmu, int cb,
+				   u32 sid)
+{
+	const char *name = dev_name(smmu->dev);
+
+	if (strcmp(name, "15000000.apps-smmu"))
+		return false;
+	if (cb != 5)
+		return false;
+
+	return sid == 0x40 || sid == 0x41;
+}
+
+static bool arm_smmu_defer_wlan_fault(struct arm_smmu_device *smmu,
+				      unsigned long iova, u32 fsr,
+				      u32 fsynr, int cb, u32 sid)
+{
+	uint delay_ms;
+	int seen;
+
+	if (!arm_smmu_is_wlan_fault(smmu, cb, sid))
+		return false;
+
+	delay_ms = READ_ONCE(arm_smmu_wlan_fault_panic_delay_ms);
+	if (!delay_ms)
+		return false;
+
+	seen = atomic_inc_return(&arm_smmu_wlan_fault_deferred);
+	if (seen == 1) {
+		dev_err(smmu->dev,
+			"Deferring WLAN SMMU panic by %u ms for diagnostics\n",
+			delay_ms);
+		wlan_ol_tx_smmu_fault_dump(iova, fsr, fsynr, cb, sid);
+		schedule_delayed_work(&arm_smmu_wlan_fault_work,
+				      msecs_to_jiffies(delay_ms));
+	} else if (seen <= 8) {
+		dev_err(smmu->dev,
+			"Suppressing repeated WLAN SMMU panic while deferred: iova=0x%08lx fsr=0x%x fsynr=0x%x access=%s cb=%d sid=0x%x repeat=%d\n",
+			iova, fsr, fsynr,
+			(fsynr & FSYNR0_WNR) ? "write" : "read",
+			cb, sid, seen);
+		wlan_ol_tx_smmu_fault_dump(iova, fsr, fsynr, cb, sid);
+	}
+
+	return true;
+}
+
 static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 {
 	int flags, ret, tmp;
@@ -1461,6 +1530,7 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 	u32 frsynra;
 	bool non_fatal_fault = !!(smmu_domain->attributes &
 					(1 << DOMAIN_ATTR_NON_FATAL_FAULTS));
+	bool deferred_wlan_fault = false;
 
 	static DEFINE_RATELIMIT_STATE(_rs,
 				      DEFAULT_RATELIMIT_INTERVAL,
@@ -1514,8 +1584,10 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 							      fsr);
 		if (__ratelimit(&_rs)) {
 			dev_err(smmu->dev,
-				"Unhandled context fault: iova=0x%08lx, fsr=0x%x, fsynr=0x%x, cb=%d\n",
-				iova, fsr, fsynr, cfg->cbndx);
+				"Unhandled context fault: iova=0x%08lx, fsr=0x%x, fsynr=0x%x, access=%s, cb=%d\n",
+				iova, fsr, fsynr,
+				(fsynr & FSYNR0_WNR) ? "write" : "read",
+				cfg->cbndx);
 			dev_err(smmu->dev, "FAR    = %016lx\n",
 				(unsigned long)iova);
 			dev_err(smmu->dev,
@@ -1543,12 +1615,17 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 				dev_err(smmu->dev, "hard iova-to-phys (ATOS) failed\n");
 			dev_err(smmu->dev, "SID=0x%x\n", frsynra);
 		}
+		deferred_wlan_fault = arm_smmu_defer_wlan_fault(
+			smmu, iova, fsr, fsynr, cfg->cbndx, frsynra);
 		ret = IRQ_NONE;
 		resume = RESUME_TERMINATE;
 		if (!non_fatal_fault) {
 			dev_err(smmu->dev,
 				"Unhandled arm-smmu context fault!\n");
-			BUG();
+			if (deferred_wlan_fault)
+				ret = IRQ_HANDLED;
+			else
+				BUG();
 		}
 	}
 

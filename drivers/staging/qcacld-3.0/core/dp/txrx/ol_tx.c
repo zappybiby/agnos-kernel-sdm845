@@ -20,6 +20,12 @@
 #include <qdf_nbuf.h>           /* qdf_nbuf_t, etc. */
 #include <qdf_atomic.h>         /* qdf_atomic_read, etc. */
 #include <qdf_util.h>           /* qdf_unlikely */
+#include <linux/iommu.h>
+#include <linux/jiffies.h>
+#include <linux/mm.h>
+#include <linux/moduleparam.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 
 /* APIs for other modules */
 #include <htt.h>                /* HTT_TX_EXT_TID_MGMT */
@@ -51,6 +57,380 @@
 
 int ce_send_fast(struct CE_handle *copyeng, qdf_nbuf_t msdu,
 		 unsigned int transfer_id, uint32_t download_len);
+
+#define OL_TX_FRAG_DESC_REVOKE_HIST_MAX 2048
+#define OL_TX_FRAG_DESC_REVOKE_MATCH_MAX 8
+#if defined(HELIUMPLUS)
+#define OL_TX_FRAG_DESC_REVOKE_DESC_LEN sizeof(struct msdu_ext_desc_t)
+#else
+#define OL_TX_FRAG_DESC_REVOKE_DESC_LEN 0x80
+#endif
+
+struct ol_tx_frag_desc_revoke_hist {
+	bool selected;
+	bool unmapped;
+	u32 seq;
+	qdf_dma_addr_t tx_desc_paddr;
+	qdf_dma_addr_t frag_desc_paddr;
+	qdf_dma_addr_t frag_page_base;
+	uint download_len;
+	u16 msdu_id;
+	u8 vdev_id;
+	u8 pkt_type;
+	unsigned long stamp;
+	size_t unmapped_len;
+	phys_addr_t phys_before;
+	phys_addr_t phys_after;
+};
+
+static int ol_tx_frag_desc_revoke_arm;
+static bool ol_tx_frag_desc_revoke_tso_only;
+static uint ol_tx_frag_desc_revoke_min_download_len;
+static int ol_tx_frag_desc_revoke_offset = -1;
+static uint ol_tx_frag_desc_revoke_offset_slop;
+static uint ol_tx_frag_desc_revoke_seen;
+static uint ol_tx_frag_desc_revoke_selected;
+static uint ol_tx_frag_desc_revoke_unmapped;
+static uint ol_tx_frag_desc_revoke_failed;
+static u32 ol_tx_frag_desc_revoke_hist_next;
+static u32 ol_tx_frag_desc_revoke_hist_drops;
+static u32 ol_tx_frag_desc_revoke_next_seq;
+static qdf_dma_addr_t ol_tx_frag_desc_revoke_last_tx_desc;
+static qdf_dma_addr_t ol_tx_frag_desc_revoke_last_frag_desc;
+static qdf_dma_addr_t ol_tx_frag_desc_revoke_last_frag_page;
+static uint ol_tx_frag_desc_revoke_last_download_len;
+static uint ol_tx_frag_desc_revoke_last_msdu_id;
+static uint ol_tx_frag_desc_revoke_last_vdev_id;
+static uint ol_tx_frag_desc_revoke_last_pkt_type;
+static size_t ol_tx_frag_desc_revoke_last_unmapped_len;
+static phys_addr_t ol_tx_frag_desc_revoke_last_phys_before;
+static phys_addr_t ol_tx_frag_desc_revoke_last_phys_after;
+static unsigned long ol_tx_frag_desc_revoke_last_jiffies;
+static struct ol_tx_frag_desc_revoke_hist
+	ol_tx_frag_desc_revoke_hist[OL_TX_FRAG_DESC_REVOKE_HIST_MAX];
+static DEFINE_SPINLOCK(ol_tx_frag_desc_revoke_lock);
+
+module_param_named(ol_tx_frag_desc_revoke_arm,
+		   ol_tx_frag_desc_revoke_arm, int, 0644);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_arm,
+		 "Unmap one posted HTT frag descriptor page after CE publish");
+module_param_named(ol_tx_frag_desc_revoke_tso_only,
+		   ol_tx_frag_desc_revoke_tso_only, bool, 0644);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_tso_only,
+		 "Limit HTT frag descriptor revoke to TSO packets");
+module_param_named(ol_tx_frag_desc_revoke_min_download_len,
+		   ol_tx_frag_desc_revoke_min_download_len, uint, 0644);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_min_download_len,
+		 "Minimum download length eligible for HTT frag descriptor revoke");
+module_param_named(ol_tx_frag_desc_revoke_offset,
+		   ol_tx_frag_desc_revoke_offset, int, 0644);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_offset,
+		 "Optional page offset filter for HTT frag descriptor revoke");
+module_param_named(ol_tx_frag_desc_revoke_offset_slop,
+		   ol_tx_frag_desc_revoke_offset_slop, uint, 0644);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_offset_slop,
+		 "Allowed page offset slop for HTT frag descriptor revoke");
+module_param_named(ol_tx_frag_desc_revoke_seen,
+		   ol_tx_frag_desc_revoke_seen, uint, 0444);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_seen,
+		 "Posted HTT frag descriptors observed");
+module_param_named(ol_tx_frag_desc_revoke_selected,
+		   ol_tx_frag_desc_revoke_selected, uint, 0444);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_selected,
+		 "Posted HTT frag descriptor revoke selections");
+module_param_named(ol_tx_frag_desc_revoke_unmapped,
+		   ol_tx_frag_desc_revoke_unmapped, uint, 0444);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_unmapped,
+		 "Posted HTT frag descriptor page unmaps completed");
+module_param_named(ol_tx_frag_desc_revoke_failed,
+		   ol_tx_frag_desc_revoke_failed, uint, 0444);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_failed,
+		 "Posted HTT frag descriptor page unmap failures");
+module_param_named(ol_tx_frag_desc_revoke_hist_drops,
+		   ol_tx_frag_desc_revoke_hist_drops, uint, 0444);
+MODULE_PARM_DESC(ol_tx_frag_desc_revoke_hist_drops,
+		 "Posted HTT frag descriptor history overwrite count");
+
+static bool ol_tx_frag_desc_iova_in_range(unsigned long iova,
+					  qdf_dma_addr_t base, uint len)
+{
+	return base && len && iova >= base && iova < base + len;
+}
+
+static bool ol_tx_frag_desc_iova_near_range(unsigned long iova,
+					    qdf_dma_addr_t base, uint len)
+{
+	const uint radius = 0x6000;
+
+	return base && len && iova + radius >= base &&
+	       iova < base + len + radius;
+}
+
+static bool ol_tx_frag_desc_revoke_offset_match(qdf_dma_addr_t paddr)
+{
+	int target = READ_ONCE(ol_tx_frag_desc_revoke_offset);
+	uint slop = READ_ONCE(ol_tx_frag_desc_revoke_offset_slop);
+	uint offset;
+
+	if (target < 0)
+		return true;
+
+	offset = paddr & (PAGE_SIZE - 1);
+	if (!slop)
+		return offset == (uint)target;
+
+	return offset >= (uint)target - min_t(uint, slop, target) &&
+	       offset <= (uint)target + slop;
+}
+
+static void
+ol_tx_frag_desc_revoke_record(struct ol_tx_desc_t *tx_desc,
+			      uint32_t download_len, u8 vdev_id,
+			      bool selected, bool unmapped,
+			      qdf_dma_addr_t frag_page_base,
+			      size_t unmapped_len,
+			      phys_addr_t phys_before,
+			      phys_addr_t phys_after)
+{
+	struct ol_tx_frag_desc_revoke_hist *entry;
+	unsigned long flags;
+	u32 next;
+
+	if (!tx_desc)
+		return;
+
+	spin_lock_irqsave(&ol_tx_frag_desc_revoke_lock, flags);
+	next = ol_tx_frag_desc_revoke_hist_next++;
+	entry = &ol_tx_frag_desc_revoke_hist[
+		next % OL_TX_FRAG_DESC_REVOKE_HIST_MAX];
+	if (next >= OL_TX_FRAG_DESC_REVOKE_HIST_MAX)
+		ol_tx_frag_desc_revoke_hist_drops++;
+	memset(entry, 0, sizeof(*entry));
+	entry->seq = ++ol_tx_frag_desc_revoke_next_seq;
+	entry->selected = selected;
+	entry->unmapped = unmapped;
+	entry->tx_desc_paddr = tx_desc->htt_tx_desc_paddr;
+	entry->frag_desc_paddr = tx_desc->htt_frag_desc_paddr;
+	entry->frag_page_base = frag_page_base;
+	entry->download_len = download_len;
+	entry->msdu_id = tx_desc->id;
+	entry->vdev_id = vdev_id;
+	entry->pkt_type = tx_desc->pkt_type;
+	entry->stamp = jiffies;
+	entry->unmapped_len = unmapped_len;
+	entry->phys_before = phys_before;
+	entry->phys_after = phys_after;
+	spin_unlock_irqrestore(&ol_tx_frag_desc_revoke_lock, flags);
+}
+
+static const char *
+ol_tx_frag_desc_revoke_match_name(unsigned long iova,
+				  const struct ol_tx_frag_desc_revoke_hist *e,
+				  long *off)
+{
+	if (ol_tx_frag_desc_iova_in_range(iova, e->frag_page_base, PAGE_SIZE)) {
+		*off = (long)(iova - e->frag_page_base);
+		return "frag_page_exact";
+	}
+	if (ol_tx_frag_desc_iova_near_range(iova, e->frag_page_base,
+					    PAGE_SIZE)) {
+		*off = (long)(iova - e->frag_page_base);
+		return "frag_page_near";
+	}
+	if (ol_tx_frag_desc_iova_in_range(iova, e->frag_desc_paddr,
+					  OL_TX_FRAG_DESC_REVOKE_DESC_LEN)) {
+		*off = (long)(iova - e->frag_desc_paddr);
+		return "frag_desc_exact";
+	}
+	if (ol_tx_frag_desc_iova_near_range(iova, e->frag_desc_paddr,
+					    OL_TX_FRAG_DESC_REVOKE_DESC_LEN)) {
+		*off = (long)(iova - e->frag_desc_paddr);
+		return "frag_desc_near";
+	}
+	if (ol_tx_frag_desc_iova_near_range(iova, e->tx_desc_paddr,
+					    sizeof(struct htt_host_tx_desc_t))) {
+		*off = (long)(iova - e->tx_desc_paddr);
+		return "tx_desc_near";
+	}
+
+	return NULL;
+}
+
+static void
+ol_tx_frag_desc_revoke_maybe(struct ol_txrx_pdev_t *pdev,
+			     ol_txrx_vdev_handle vdev,
+			     struct ol_tx_desc_t *tx_desc,
+			     uint32_t download_len)
+{
+	struct iommu_domain *domain;
+	qdf_dma_addr_t frag_desc;
+	qdf_dma_addr_t frag_page;
+	unsigned long flags;
+	phys_addr_t phys_before;
+	phys_addr_t phys_after;
+	size_t unmapped;
+	bool selected = false;
+
+	if (!pdev || !pdev->osdev || !pdev->osdev->dev || !vdev || !tx_desc)
+		return;
+
+	if (READ_ONCE(ol_tx_frag_desc_revoke_arm) <= 0)
+		return;
+	if (READ_ONCE(ol_tx_frag_desc_revoke_tso_only) &&
+	    tx_desc->pkt_type != OL_TX_FRM_TSO)
+		return;
+	if (download_len < READ_ONCE(ol_tx_frag_desc_revoke_min_download_len))
+		return;
+
+	frag_desc = tx_desc->htt_frag_desc_paddr;
+	if (!frag_desc || !ol_tx_frag_desc_revoke_offset_match(frag_desc)) {
+		ol_tx_frag_desc_revoke_record(tx_desc, download_len,
+					      vdev->vdev_id, false, false,
+					      frag_desc & PAGE_MASK, 0, 0, 0);
+		return;
+	}
+
+	domain = iommu_get_domain_for_dev(pdev->osdev->dev);
+	if (!domain) {
+		ol_tx_frag_desc_revoke_failed++;
+		ol_tx_frag_desc_revoke_record(tx_desc, download_len,
+					      vdev->vdev_id, false, false,
+					      frag_desc & PAGE_MASK, 0, 0, 0);
+		return;
+	}
+
+	ol_tx_frag_desc_revoke_seen++;
+	frag_page = frag_desc & PAGE_MASK;
+
+	spin_lock_irqsave(&ol_tx_frag_desc_revoke_lock, flags);
+	if (READ_ONCE(ol_tx_frag_desc_revoke_arm) > 0) {
+		WRITE_ONCE(ol_tx_frag_desc_revoke_arm,
+			   READ_ONCE(ol_tx_frag_desc_revoke_arm) - 1);
+		selected = true;
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_tx_desc,
+			   tx_desc->htt_tx_desc_paddr);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_frag_desc, frag_desc);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_frag_page, frag_page);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_download_len,
+			   download_len);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_msdu_id, tx_desc->id);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_vdev_id, vdev->vdev_id);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_pkt_type,
+			   tx_desc->pkt_type);
+		WRITE_ONCE(ol_tx_frag_desc_revoke_last_jiffies, jiffies);
+	}
+	spin_unlock_irqrestore(&ol_tx_frag_desc_revoke_lock, flags);
+
+	if (!selected) {
+		ol_tx_frag_desc_revoke_record(tx_desc, download_len,
+					      vdev->vdev_id, false, false,
+					      frag_page, 0, 0, 0);
+		return;
+	}
+
+	ol_tx_frag_desc_revoke_selected++;
+	phys_before = iommu_iova_to_phys(domain, frag_page);
+	unmapped = iommu_unmap(domain, frag_page, PAGE_SIZE);
+	phys_after = iommu_iova_to_phys(domain, frag_page);
+	WRITE_ONCE(ol_tx_frag_desc_revoke_last_unmapped_len, unmapped);
+	WRITE_ONCE(ol_tx_frag_desc_revoke_last_phys_before, phys_before);
+	WRITE_ONCE(ol_tx_frag_desc_revoke_last_phys_after, phys_after);
+	WRITE_ONCE(ol_tx_frag_desc_revoke_last_jiffies, jiffies);
+
+	if (unmapped >= PAGE_SIZE) {
+		ol_tx_frag_desc_revoke_unmapped++;
+		ol_tx_frag_desc_revoke_record(tx_desc, download_len,
+					      vdev->vdev_id, true, true,
+					      frag_page, unmapped,
+					      phys_before, phys_after);
+		pr_err("wlan_ol_tx_frag_desc_revoke: unmapped frag_page=0x%llx frag_desc=0x%llx tx_desc=0x%llx download_len=0x%x msdu_id=%u vdev_id=%u pkt_type=%u phys_before=0x%llx phys_after=0x%llx remaining=%d\n",
+		       (unsigned long long)frag_page,
+		       (unsigned long long)frag_desc,
+		       (unsigned long long)tx_desc->htt_tx_desc_paddr,
+		       download_len, tx_desc->id, vdev->vdev_id,
+		       tx_desc->pkt_type, (unsigned long long)phys_before,
+		       (unsigned long long)phys_after,
+		       READ_ONCE(ol_tx_frag_desc_revoke_arm));
+		return;
+	}
+
+	ol_tx_frag_desc_revoke_failed++;
+	ol_tx_frag_desc_revoke_record(tx_desc, download_len,
+				      vdev->vdev_id, true, false,
+				      frag_page, unmapped,
+				      phys_before, phys_after);
+	pr_err("wlan_ol_tx_frag_desc_revoke: failed frag_page=0x%llx frag_desc=0x%llx tx_desc=0x%llx download_len=0x%x msdu_id=%u vdev_id=%u pkt_type=%u unmapped=%zu phys_before=0x%llx phys_after=0x%llx remaining=%d\n",
+	       (unsigned long long)frag_page,
+	       (unsigned long long)frag_desc,
+	       (unsigned long long)tx_desc->htt_tx_desc_paddr,
+	       download_len, tx_desc->id, vdev->vdev_id, tx_desc->pkt_type,
+	       unmapped, (unsigned long long)phys_before,
+	       (unsigned long long)phys_after,
+	       READ_ONCE(ol_tx_frag_desc_revoke_arm));
+}
+
+void wlan_ol_tx_smmu_fault_dump(unsigned long iova, u32 fsr, u32 fsynr,
+				int cb, u32 sid)
+{
+	unsigned long flags;
+	unsigned long stamp;
+	const char *match;
+	long off;
+	int printed = 0;
+	int i;
+
+	stamp = READ_ONCE(ol_tx_frag_desc_revoke_last_jiffies);
+	if (READ_ONCE(ol_tx_frag_desc_revoke_selected) ||
+	    READ_ONCE(ol_tx_frag_desc_revoke_seen))
+		pr_err("wlan_ol_tx_frag_desc_revoke: smmu_fault iova=0x%lx fsr=0x%x fsynr=0x%x cb=%d sid=0x%x last_frag_page=0x%llx last_frag_desc=0x%llx last_tx_desc=0x%llx download_len=0x%x msdu_id=%u vdev_id=%u pkt_type=%u seen=%u selected=%u unmapped=%u failed=%u hist_next=%u hist_drops=%u last_unmapped=%zu phys_before=0x%llx phys_after=0x%llx age_ms=%u\n",
+		       iova, fsr, fsynr, cb, sid,
+		       (unsigned long long)READ_ONCE(
+			       ol_tx_frag_desc_revoke_last_frag_page),
+		       (unsigned long long)READ_ONCE(
+			       ol_tx_frag_desc_revoke_last_frag_desc),
+		       (unsigned long long)READ_ONCE(
+			       ol_tx_frag_desc_revoke_last_tx_desc),
+		       READ_ONCE(ol_tx_frag_desc_revoke_last_download_len),
+		       READ_ONCE(ol_tx_frag_desc_revoke_last_msdu_id),
+		       READ_ONCE(ol_tx_frag_desc_revoke_last_vdev_id),
+		       READ_ONCE(ol_tx_frag_desc_revoke_last_pkt_type),
+		       READ_ONCE(ol_tx_frag_desc_revoke_seen),
+		       READ_ONCE(ol_tx_frag_desc_revoke_selected),
+		       READ_ONCE(ol_tx_frag_desc_revoke_unmapped),
+		       READ_ONCE(ol_tx_frag_desc_revoke_failed),
+		       READ_ONCE(ol_tx_frag_desc_revoke_hist_next),
+		       READ_ONCE(ol_tx_frag_desc_revoke_hist_drops),
+		       READ_ONCE(ol_tx_frag_desc_revoke_last_unmapped_len),
+		       (unsigned long long)READ_ONCE(
+			       ol_tx_frag_desc_revoke_last_phys_before),
+		       (unsigned long long)READ_ONCE(
+			       ol_tx_frag_desc_revoke_last_phys_after),
+		       stamp ? jiffies_to_msecs(jiffies - stamp) : 0);
+
+	spin_lock_irqsave(&ol_tx_frag_desc_revoke_lock, flags);
+	for (i = 0; i < OL_TX_FRAG_DESC_REVOKE_HIST_MAX &&
+	     printed < OL_TX_FRAG_DESC_REVOKE_MATCH_MAX; i++) {
+		struct ol_tx_frag_desc_revoke_hist *e =
+			&ol_tx_frag_desc_revoke_hist[i];
+
+		if (!e->seq)
+			continue;
+		match = ol_tx_frag_desc_revoke_match_name(iova, e, &off);
+		if (!match)
+			continue;
+		printed++;
+		pr_err("wlan_ol_tx_frag_desc_revoke: fault_match=%s slot=%d seq=%u selected=%u unmapped=%u off=%ld frag_page=0x%llx frag_desc=0x%llx tx_desc=0x%llx download_len=0x%x msdu_id=%u vdev_id=%u pkt_type=%u unmapped_len=%zu phys_before=0x%llx phys_after=0x%llx age_ms=%u\n",
+		       match, i, e->seq, e->selected, e->unmapped, off,
+		       (unsigned long long)e->frag_page_base,
+		       (unsigned long long)e->frag_desc_paddr,
+		       (unsigned long long)e->tx_desc_paddr,
+		       e->download_len, e->msdu_id, e->vdev_id, e->pkt_type,
+		       e->unmapped_len, (unsigned long long)e->phys_before,
+		       (unsigned long long)e->phys_after,
+		       e->stamp ? jiffies_to_msecs(jiffies - e->stamp) : 0);
+	}
+	spin_unlock_irqrestore(&ol_tx_frag_desc_revoke_lock, flags);
+}
 #endif  /* WLAN_FEATURE_FASTPATH */
 
 /*
@@ -867,6 +1247,9 @@ ol_tx_ll_fast(ol_txrx_vdev_handle vdev, qdf_nbuf_t msdu_list,
 						htt_tx_status_download_fail);
 					return msdu;
 				}
+				ol_tx_frag_desc_revoke_maybe(pdev, vdev,
+							     tx_desc,
+							     pkt_download_len);
 				if (msdu_info.tso_info.curr_seg)
 					msdu_info.tso_info.curr_seg = next_seg;
 
@@ -974,17 +1357,19 @@ ol_tx_ll_fast(ol_txrx_vdev_handle vdev, qdf_nbuf_t msdu_list,
 			 * pointer before the ce_send call.
 			 */
 			next = qdf_nbuf_next(msdu);
-			if ((0 == ce_send_fast(pdev->ce_tx_hdl, msdu,
-					       ep_id, pkt_download_len))) {
+				if ((0 == ce_send_fast(pdev->ce_tx_hdl, msdu,
+						       ep_id, pkt_download_len))) {
 				/*
 				 * The packet could not be sent
 				 * Free the descriptor, return the packet to the
 				 * caller
 				 */
-				ol_tx_desc_free(pdev, tx_desc);
-				return msdu;
-			}
-			msdu = next;
+					ol_tx_desc_free(pdev, tx_desc);
+					return msdu;
+				}
+				ol_tx_frag_desc_revoke_maybe(pdev, vdev, tx_desc,
+							     pkt_download_len);
+				msdu = next;
 		} else {
 			TXRX_STATS_MSDU_LIST_INCR(
 				pdev, tx.dropped.host_reject, msdu);
