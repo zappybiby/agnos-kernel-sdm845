@@ -24,6 +24,7 @@
 #include <qdf_lock.h>           /* qdf_spinlock */
 #include <qdf_atomic.h>         /* qdf_atomic_read */
 #include <qdf_debugfs.h>
+#include <linux/module.h>
 
 #if defined(HIF_PCI) || defined(HIF_SNOC) || defined(HIF_AHB)
 /* Required for WLAN_FEATURE_FASTPATH */
@@ -86,10 +87,82 @@
 /* thresh for peer's cached buf queue beyond which the elements are dropped */
 #define OL_TXRX_CACHED_BUFQ_THRESH 128
 
+static int htt_tx_freelist_start;
+module_param_named(htt_tx_freelist_start, htt_tx_freelist_start, int, 0600);
+MODULE_PARM_DESC(htt_tx_freelist_start,
+		 "HTT TX freelist start ID: 0 off, -1 first page gap + 8, -2 first descriptor gap + 8, N fixed ID");
+
 #define DPT_DEBUGFS_PERMS	(QDF_FILE_USR_READ |	\
 				QDF_FILE_USR_WRITE |	\
 				QDF_FILE_GRP_READ |	\
 				QDF_FILE_OTH_READ)
+
+static int ol_tx_frag_bank_repro_start_id(struct ol_txrx_pdev_t *pdev,
+					  int desc_pool_size)
+{
+	int start = READ_ONCE(htt_tx_freelist_start);
+	uint16_t first_bad;
+
+	if (!start)
+		return 0;
+
+	if (start == -1) {
+		first_bad =
+			htt_tx_frag_bank_first_page_gap_index(pdev->htt_pdev);
+		if (first_bad == 0xffff) {
+			pr_err("HTT TX FREELIST ROTATE: first page gap unavailable\n");
+			return 0;
+		}
+		start = first_bad + 8;
+	} else if (start == -2) {
+		first_bad =
+			htt_tx_frag_bank_first_desc_gap_index(pdev->htt_pdev);
+		if (first_bad == 0xffff) {
+			pr_err("HTT TX FREELIST ROTATE: first descriptor gap unavailable\n");
+			return 0;
+		}
+		start = first_bad + 8;
+	}
+
+	if (start <= 0 || start >= desc_pool_size) {
+		pr_err("HTT TX FREELIST ROTATE: invalid start=%d pool_size=%d requested=%d\n",
+		       start, desc_pool_size, htt_tx_freelist_start);
+		return 0;
+	}
+
+	return start;
+}
+
+static void ol_tx_frag_bank_repro_rotate_freelist(struct ol_txrx_pdev_t *pdev,
+						  int desc_pool_size)
+{
+	union ol_tx_desc_list_elem_t *old_head;
+	union ol_tx_desc_list_elem_t *start_elem;
+	union ol_tx_desc_list_elem_t *prev_elem;
+	union ol_tx_desc_list_elem_t *last_elem;
+	int start;
+
+	start = ol_tx_frag_bank_repro_start_id(pdev, desc_pool_size);
+	if (!start)
+		return;
+
+	old_head = pdev->tx_desc.freelist;
+	start_elem = (union ol_tx_desc_list_elem_t *)
+		ol_tx_desc_find(pdev, start);
+	prev_elem = (union ol_tx_desc_list_elem_t *)
+		ol_tx_desc_find(pdev, start - 1);
+	last_elem = (union ol_tx_desc_list_elem_t *)
+		ol_tx_desc_find(pdev, desc_pool_size - 1);
+
+	last_elem->next = old_head;
+	prev_elem->next = NULL;
+	pdev->tx_desc.freelist = start_elem;
+
+	pr_err("HTT TX FREELIST ROTATE: requested=%d start_id=%d pool_size=%d first_page_bad=%u first_desc_bad=%u\n",
+	       htt_tx_freelist_start, start, desc_pool_size,
+	       htt_tx_frag_bank_first_page_gap_index(pdev->htt_pdev),
+	       htt_tx_frag_bank_first_desc_gap_index(pdev->htt_pdev));
+}
 
 #define DPT_DEBUGFS_NUMBER_BASE	10
 /**
@@ -1744,6 +1817,7 @@ ol_txrx_pdev_post_attach(ol_txrx_pdev_handle pdev)
 		c_element = c_element->next;
 		fail_idx = i;
 	}
+	ol_tx_frag_bank_repro_rotate_freelist(pdev, desc_pool_size);
 
 	/* link SW tx descs into a freelist */
 	pdev->tx_desc.num_free = desc_pool_size;
