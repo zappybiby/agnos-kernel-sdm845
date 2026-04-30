@@ -32,6 +32,7 @@
 #include <qdf_mem.h>         /* qdf_mem_alloc_consistent et al */
 #include <qdf_nbuf.h>           /* qdf_nbuf_t, etc. */
 #include <qdf_time.h>           /* qdf_mdelay */
+#include <linux/module.h>
 
 #include <htt.h>                /* htt_tx_msdu_desc_t */
 #include <htc.h>                /* HTC_HDR_LENGTH */
@@ -89,6 +90,12 @@ static qdf_dma_addr_t htt_tx_get_paddr(htt_pdev_handle pdev,
 #ifdef HELIUMPLUS
 
 #define HTT_TX_FRAG_BANK_INVALID_INDEX 0xffff
+
+static bool htt_tx_frag_bank_spacers;
+module_param_named(htt_tx_frag_bank_spacers, htt_tx_frag_bank_spacers, bool,
+		   0600);
+MODULE_PARM_DESC(htt_tx_frag_bank_spacers,
+		 "Interleave and release coherent spacer pages during HTT frag-desc allocation");
 
 /**
  * htt_tx_desc_get_size() - get tx descripotrs size
@@ -321,6 +328,109 @@ htt_tx_frag_bank_note_publish(struct htt_pdev_t *pdev, uint16_t msdu_id)
 	}
 }
 
+static void
+htt_tx_frag_desc_free_dma_page_array(qdf_device_t osdev,
+				     struct qdf_mem_dma_page_t *dma_pages,
+				     uint16_t num_pages,
+				     qdf_dma_context_t memctxt)
+{
+	uint16_t page_idx;
+
+	if (!dma_pages)
+		return;
+
+	for (page_idx = 0; page_idx < num_pages; page_idx++) {
+		if (!dma_pages[page_idx].page_v_addr_start)
+			continue;
+
+		qdf_mem_free_consistent(osdev, osdev->dev, PAGE_SIZE,
+					dma_pages[page_idx].page_v_addr_start,
+					dma_pages[page_idx].page_p_addr,
+					memctxt);
+	}
+}
+
+static int
+htt_tx_frag_desc_alloc_with_spacers(qdf_device_t osdev,
+				    struct qdf_mem_multi_page_t *pages,
+				    size_t element_size, uint16_t element_num,
+				    qdf_dma_context_t memctxt)
+{
+	struct qdf_mem_dma_page_t *spacer_pages = NULL;
+	uint16_t page_idx;
+	uint16_t real_alloc = 0;
+	uint16_t spacer_alloc = 0;
+
+	pages->num_element_per_page = PAGE_SIZE / element_size;
+	if (!pages->num_element_per_page) {
+		qdf_print("Invalid page %d or element size %d",
+			  (int)PAGE_SIZE, (int)element_size);
+		pages->num_pages = 0;
+		pages->dma_pages = NULL;
+		pages->cacheable_pages = NULL;
+		return -EINVAL;
+	}
+
+	pages->num_pages = element_num / pages->num_element_per_page;
+	if (element_num % pages->num_element_per_page)
+		pages->num_pages++;
+
+	pages->dma_pages = qdf_mem_malloc(pages->num_pages *
+					  sizeof(*pages->dma_pages));
+	if (!pages->dma_pages)
+		goto out_fail;
+
+	spacer_pages = qdf_mem_malloc(pages->num_pages * sizeof(*spacer_pages));
+	if (!spacer_pages)
+		goto out_fail;
+
+	for (page_idx = 0; page_idx < pages->num_pages; page_idx++) {
+		pages->dma_pages[page_idx].page_v_addr_start =
+			qdf_mem_alloc_consistent(osdev, osdev->dev, PAGE_SIZE,
+				&pages->dma_pages[page_idx].page_p_addr);
+		if (!pages->dma_pages[page_idx].page_v_addr_start)
+			goto page_alloc_fail;
+
+		pages->dma_pages[page_idx].page_v_addr_end =
+			pages->dma_pages[page_idx].page_v_addr_start + PAGE_SIZE;
+		real_alloc++;
+
+		spacer_pages[page_idx].page_v_addr_start =
+			qdf_mem_alloc_consistent(osdev, osdev->dev, PAGE_SIZE,
+				&spacer_pages[page_idx].page_p_addr);
+		if (!spacer_pages[page_idx].page_v_addr_start)
+			goto page_alloc_fail;
+
+		spacer_pages[page_idx].page_v_addr_end =
+			spacer_pages[page_idx].page_v_addr_start + PAGE_SIZE;
+		spacer_alloc++;
+	}
+
+	htt_tx_frag_desc_free_dma_page_array(osdev, spacer_pages,
+					     spacer_alloc, memctxt);
+	qdf_mem_free(spacer_pages);
+	pages->cacheable_pages = NULL;
+
+	pr_err("HTT FRAG BANK SPACERS: pages=%u elem_size=%u elems_per_page=%u spacers_freed=%u\n",
+	       (unsigned int)pages->num_pages, (unsigned int)element_size,
+	       (unsigned int)pages->num_element_per_page,
+	       (unsigned int)spacer_alloc);
+	return 0;
+
+page_alloc_fail:
+	htt_tx_frag_desc_free_dma_page_array(osdev, spacer_pages,
+					     spacer_alloc, memctxt);
+	qdf_mem_free(spacer_pages);
+out_fail:
+	htt_tx_frag_desc_free_dma_page_array(osdev, pages->dma_pages,
+					     real_alloc, memctxt);
+	qdf_mem_free(pages->dma_pages);
+	pages->dma_pages = NULL;
+	pages->cacheable_pages = NULL;
+	pages->num_pages = 0;
+	return -ENOMEM;
+}
+
 /**
  * htt_tx_frag_desc_attach() - Attach fragment descriptor
  * @pdev:		htt device instance pointer
@@ -333,10 +443,18 @@ htt_tx_frag_bank_note_publish(struct htt_pdev_t *pdev, uint16_t msdu_id)
 static int htt_tx_frag_desc_attach(struct htt_pdev_t *pdev,
 	uint16_t desc_pool_elems)
 {
+	qdf_dma_context_t memctxt;
+
 	pdev->frag_descs.pool_elems = desc_pool_elems;
-	qdf_mem_multi_pages_alloc(pdev->osdev, &pdev->frag_descs.desc_pages,
-		pdev->frag_descs.size, desc_pool_elems,
-		qdf_get_dma_mem_context((&pdev->frag_descs), memctx), false);
+	memctxt = qdf_get_dma_mem_context((&pdev->frag_descs), memctx);
+	if (READ_ONCE(htt_tx_frag_bank_spacers))
+		htt_tx_frag_desc_alloc_with_spacers(pdev->osdev,
+			&pdev->frag_descs.desc_pages, pdev->frag_descs.size,
+			desc_pool_elems, memctxt);
+	else
+		qdf_mem_multi_pages_alloc(pdev->osdev,
+			&pdev->frag_descs.desc_pages, pdev->frag_descs.size,
+			desc_pool_elems, memctxt, false);
 	if ((0 == pdev->frag_descs.desc_pages.num_pages) ||
 		(NULL == pdev->frag_descs.desc_pages.dma_pages)) {
 		ol_txrx_err("FRAG descriptor alloc fail");
