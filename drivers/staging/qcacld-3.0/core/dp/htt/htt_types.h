@@ -382,6 +382,15 @@ struct htt_pdev_t {
 		int size; /* of each Fragment/MSDU-Ext descriptor */
 		int pool_elems;
 		struct qdf_mem_multi_page_t desc_pages;
+		qdf_dma_addr_t bank_base_iova;
+		uint16_t bank_first_gap_page;
+		uint16_t bank_first_page_gap_index;
+		uint16_t bank_first_desc_gap_index;
+		uint16_t bank_max_msdu_id;
+		bool bank_has_page_gap;
+		bool bank_has_desc_gap;
+		bool bank_page_gap_reported;
+		bool bank_desc_gap_reported;
 		qdf_dma_mem_context(memctx);
 	} frag_descs;
 #endif /* defined(HELIUMPLUS) */

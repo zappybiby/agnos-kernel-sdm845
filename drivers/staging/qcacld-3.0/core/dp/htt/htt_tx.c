@@ -87,6 +87,9 @@ static qdf_dma_addr_t htt_tx_get_paddr(htt_pdev_handle pdev,
 				char *target_vaddr);
 
 #ifdef HELIUMPLUS
+
+#define HTT_TX_FRAG_BANK_INVALID_INDEX 0xffff
+
 /**
  * htt_tx_desc_get_size() - get tx descripotrs size
  * @pdev:	htt device instance pointer
@@ -144,6 +147,164 @@ static void htt_tx_frag_desc_field_update(struct htt_pdev_t *pdev,
 	HTT_TX_DESC_FRAG_FIELD_HI_UPDATE(fptr);
 }
 
+static qdf_dma_addr_t
+htt_tx_frag_bank_host_iova(struct htt_pdev_t *pdev, uint16_t index)
+{
+	struct qdf_mem_multi_page_t *pages = &pdev->frag_descs.desc_pages;
+	struct qdf_mem_dma_page_t *dma_page;
+	uint16_t elems_per_page;
+	uint16_t target_page;
+	uint16_t offset;
+
+	elems_per_page = pages->num_element_per_page;
+	if (!elems_per_page || !pages->dma_pages)
+		return 0;
+
+	target_page = index / elems_per_page;
+	if (target_page >= pages->num_pages)
+		return 0;
+
+	offset = index % elems_per_page;
+	dma_page = &pages->dma_pages[target_page];
+
+	return dma_page->page_p_addr + offset * pdev->frag_descs.size;
+}
+
+static qdf_dma_addr_t
+htt_tx_frag_bank_linear_iova(struct htt_pdev_t *pdev, uint16_t index)
+{
+	return pdev->frag_descs.bank_base_iova +
+	       (qdf_dma_addr_t)index * pdev->frag_descs.size;
+}
+
+static void htt_tx_frag_bank_check_layout(struct htt_pdev_t *pdev)
+{
+	struct qdf_mem_multi_page_t *pages = &pdev->frag_descs.desc_pages;
+	qdf_dma_addr_t base;
+	uint32_t slack;
+	uint16_t page;
+	uint16_t elems_per_page;
+	uint16_t first_index;
+
+	pdev->frag_descs.bank_base_iova = 0;
+	pdev->frag_descs.bank_first_gap_page = HTT_TX_FRAG_BANK_INVALID_INDEX;
+	pdev->frag_descs.bank_first_page_gap_index =
+		HTT_TX_FRAG_BANK_INVALID_INDEX;
+	pdev->frag_descs.bank_first_desc_gap_index =
+		HTT_TX_FRAG_BANK_INVALID_INDEX;
+	pdev->frag_descs.bank_max_msdu_id = 0;
+	pdev->frag_descs.bank_has_page_gap = false;
+	pdev->frag_descs.bank_has_desc_gap = false;
+	pdev->frag_descs.bank_page_gap_reported = false;
+	pdev->frag_descs.bank_desc_gap_reported = false;
+
+	if (!pages->dma_pages || !pages->num_pages ||
+	    !pages->num_element_per_page || !pdev->frag_descs.size)
+		return;
+
+	base = pages->dma_pages[0].page_p_addr;
+	elems_per_page = pages->num_element_per_page;
+	slack = PAGE_SIZE - elems_per_page * pdev->frag_descs.size;
+
+	pdev->frag_descs.bank_base_iova = base;
+
+	for (page = 0; page < pages->num_pages; page++) {
+		qdf_dma_addr_t actual;
+		qdf_dma_addr_t expected_page;
+		qdf_dma_addr_t expected_desc;
+
+		first_index = page * elems_per_page;
+		actual = pages->dma_pages[page].page_p_addr;
+		expected_page = base + (qdf_dma_addr_t)page * PAGE_SIZE;
+		expected_desc = base +
+			(qdf_dma_addr_t)first_index * pdev->frag_descs.size;
+
+		if (actual != expected_page &&
+		    !pdev->frag_descs.bank_has_page_gap) {
+			pdev->frag_descs.bank_has_page_gap = true;
+			pdev->frag_descs.bank_first_gap_page = page;
+			pdev->frag_descs.bank_first_page_gap_index = first_index;
+			pr_err("HTT FRAG BANK GAP: page=%u expected_page=0x%llx actual_page=0x%llx first_bad_host_index=%u elems_per_page=%u desc_size=%u\n",
+			       (unsigned int)page,
+			       (unsigned long long)expected_page,
+			       (unsigned long long)actual,
+			       (unsigned int)first_index,
+			       (unsigned int)elems_per_page,
+			       (unsigned int)pdev->frag_descs.size);
+		}
+
+		if (actual != expected_desc &&
+		    !pdev->frag_descs.bank_has_desc_gap) {
+			pdev->frag_descs.bank_has_desc_gap = true;
+			pdev->frag_descs.bank_first_desc_gap_index = first_index;
+			pr_err("HTT FRAG BANK DESC_GAP: page=%u first_index=%u expected_desc=0x%llx host_desc=0x%llx desc_size=%u slack_per_page=%u\n",
+			       (unsigned int)page, (unsigned int)first_index,
+			       (unsigned long long)expected_desc,
+			       (unsigned long long)actual,
+			       (unsigned int)pdev->frag_descs.size,
+			       (unsigned int)slack);
+		}
+	}
+
+	pr_err("HTT FRAG BANK SUMMARY: base=0x%llx pages=%u pool_elems=%u desc_size=%u elems_per_page=%u slack_per_page=%u page_linear=%u desc_linear=%u first_page_gap_index=%u first_desc_gap_index=%u\n",
+	       (unsigned long long)base, (unsigned int)pages->num_pages,
+	       (unsigned int)pdev->frag_descs.pool_elems,
+	       (unsigned int)pdev->frag_descs.size,
+	       (unsigned int)elems_per_page, (unsigned int)slack,
+	       (unsigned int)!pdev->frag_descs.bank_has_page_gap,
+	       (unsigned int)!pdev->frag_descs.bank_has_desc_gap,
+	       (unsigned int)pdev->frag_descs.bank_first_page_gap_index,
+	       (unsigned int)pdev->frag_descs.bank_first_desc_gap_index);
+}
+
+static void
+htt_tx_frag_bank_note_publish(struct htt_pdev_t *pdev, uint16_t msdu_id)
+{
+	qdf_dma_addr_t host_iova;
+	qdf_dma_addr_t linear_iova;
+	uint16_t old_max;
+
+	if (!pdev || !pdev->frag_descs.bank_base_iova)
+		return;
+
+	old_max = pdev->frag_descs.bank_max_msdu_id;
+	if (msdu_id > old_max)
+		pdev->frag_descs.bank_max_msdu_id = msdu_id;
+
+	host_iova = htt_tx_frag_bank_host_iova(pdev, msdu_id);
+	linear_iova = htt_tx_frag_bank_linear_iova(pdev, msdu_id);
+
+	if (msdu_id > old_max && !old_max)
+		pr_err("HTT FRAG BANK TX_FIRST_PUBLISH: msdu_id=%u host_iova=0x%llx linear_iova=0x%llx first_page_gap_index=%u first_desc_gap_index=%u\n",
+		       (unsigned int)msdu_id, (unsigned long long)host_iova,
+		       (unsigned long long)linear_iova,
+		       (unsigned int)pdev->frag_descs.bank_first_page_gap_index,
+		       (unsigned int)pdev->frag_descs.bank_first_desc_gap_index);
+
+	if (pdev->frag_descs.bank_has_page_gap &&
+	    !pdev->frag_descs.bank_page_gap_reported &&
+	    msdu_id >= pdev->frag_descs.bank_first_page_gap_index) {
+		pdev->frag_descs.bank_page_gap_reported = true;
+		pr_err("HTT FRAG BANK TX_REACHED_PAGE_GAP: msdu_id=%u old_max=%u first_gap_page=%u first_gap_index=%u host_iova=0x%llx linear_iova=0x%llx\n",
+		       (unsigned int)msdu_id, (unsigned int)old_max,
+		       (unsigned int)pdev->frag_descs.bank_first_gap_page,
+		       (unsigned int)pdev->frag_descs.bank_first_page_gap_index,
+		       (unsigned long long)host_iova,
+		       (unsigned long long)linear_iova);
+	}
+
+	if (!pdev->frag_descs.bank_desc_gap_reported &&
+	    pdev->frag_descs.bank_has_desc_gap &&
+	    msdu_id >= pdev->frag_descs.bank_first_desc_gap_index) {
+		pdev->frag_descs.bank_desc_gap_reported = true;
+		pr_err("HTT FRAG BANK TX_REACHED_DESC_GAP: msdu_id=%u old_max=%u first_desc_gap_index=%u host_iova=0x%llx linear_iova=0x%llx\n",
+		       (unsigned int)msdu_id, (unsigned int)old_max,
+		       (unsigned int)pdev->frag_descs.bank_first_desc_gap_index,
+		       (unsigned long long)host_iova,
+		       (unsigned long long)linear_iova);
+	}
+}
+
 /**
  * htt_tx_frag_desc_attach() - Attach fragment descriptor
  * @pdev:		htt device instance pointer
@@ -165,6 +326,7 @@ static int htt_tx_frag_desc_attach(struct htt_pdev_t *pdev,
 		ol_txrx_err("FRAG descriptor alloc fail");
 		return -ENOBUFS;
 	}
+	htt_tx_frag_bank_check_layout(pdev);
 	return 0;
 }
 
@@ -281,6 +443,7 @@ static void htt_tx_frag_desc_field_update(struct htt_pdev_t *pdev,
 		HTT_TX_DESC_LEN;
 }
 #endif
+
 
 /**
  * htt_tx_frag_desc_attach() - Attach fragment descriptor
@@ -741,6 +904,10 @@ void htt_tx_sched(htt_pdev_handle pdev)
 	HTT_TX_NBUF_QUEUE_REMOVE(pdev, msdu);
 	while (msdu != NULL) {
 		int not_accepted;
+#ifdef HELIUMPLUS
+		uint16_t *msdu_id_storage;
+		uint16_t msdu_id;
+#endif
 		/* packet length includes HTT tx desc frag added above */
 		packet_len = qdf_nbuf_len(msdu);
 		if (packet_len < download_len) {
@@ -757,6 +924,10 @@ void htt_tx_sched(htt_pdev_handle pdev)
 			download_len = packet_len;
 		}
 
+#ifdef HELIUMPLUS
+		msdu_id_storage = ol_tx_msdu_id_storage(msdu);
+		msdu_id = *msdu_id_storage;
+#endif
 		not_accepted =
 			htc_send_data_pkt(pdev->htc_pdev, msdu,
 					  pdev->htc_tx_endpoint,
@@ -765,6 +936,9 @@ void htt_tx_sched(htt_pdev_handle pdev)
 			HTT_TX_NBUF_QUEUE_INSERT_HEAD(pdev, msdu);
 			return;
 		}
+#ifdef HELIUMPLUS
+		htt_tx_frag_bank_note_publish(pdev, msdu_id);
+#endif
 		HTT_TX_NBUF_QUEUE_REMOVE(pdev, msdu);
 	}
 }
@@ -808,6 +982,10 @@ int htt_tx_send_std(htt_pdev_handle pdev, qdf_nbuf_t msdu, uint16_t msdu_id)
 	if (htc_send_data_pkt(pdev->htc_pdev, msdu,
 			      pdev->htc_tx_endpoint, download_len)) {
 		HTT_TX_NBUF_QUEUE_ADD(pdev, msdu);
+	} else {
+#ifdef HELIUMPLUS
+		htt_tx_frag_bank_note_publish(pdev, msdu_id);
+#endif
 	}
 
 	return 0;               /* success */
@@ -942,6 +1120,9 @@ htt_tx_send_base(htt_pdev_handle pdev,
 				qdf_nbuf_data_addr(msdu),
 				sizeof(qdf_nbuf_data(msdu)), QDF_TX));
 	htc_send_data_pkt(pdev->htc_pdev, &pkt->htc_pkt, more_data);
+#ifdef HELIUMPLUS
+	htt_tx_frag_bank_note_publish(pdev, msdu_id);
+#endif
 
 	return 0;               /* success */
 }
@@ -1941,4 +2122,3 @@ void htt_tx_group_credit_process(struct htt_pdev_t *pdev, u_int32_t *msg_word)
 	ol_tx_update_group_credit_stats(pdev->txrx_pdev);
 }
 #endif
-
