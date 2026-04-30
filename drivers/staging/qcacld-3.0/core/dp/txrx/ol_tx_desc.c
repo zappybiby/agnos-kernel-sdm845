@@ -21,6 +21,7 @@
 #include <qdf_util.h>           /* qdf_assert */
 #include <qdf_lock.h>           /* qdf_spinlock */
 #include <qdf_trace.h>          /* qdf_tso_seg_dbg stuff */
+#include <linux/atomic.h>
 #ifdef QCA_COMPUTE_TX_DELAY
 #include <qdf_time.h>           /* qdf_system_ticks */
 #endif
@@ -33,6 +34,58 @@
 #include <ol_txrx_encap.h>      /* OL_TX_RESTORE_HDR, etc */
 #endif
 #include <ol_txrx.h>
+
+static atomic_t ol_tx_max_id_seen = ATOMIC_INIT(0);
+
+static bool ol_tx_id_crossed(unsigned int old, unsigned int id,
+			     unsigned int boundary)
+{
+	return boundary != 0xffff && old < boundary && id >= boundary;
+}
+
+static void ol_tx_note_desc_id(struct ol_txrx_pdev_t *pdev, unsigned int id)
+{
+	unsigned int old;
+	unsigned int max;
+	unsigned int first_page_bad;
+	unsigned int first_desc_bad;
+
+	old = atomic_read(&ol_tx_max_id_seen);
+	while (id > old) {
+		if (atomic_cmpxchg(&ol_tx_max_id_seen, old, id) == old)
+			break;
+		old = atomic_read(&ol_tx_max_id_seen);
+	}
+
+	if (id <= old)
+		return;
+
+	max = atomic_read(&ol_tx_max_id_seen);
+	first_page_bad = htt_tx_frag_bank_first_page_gap_index(pdev->htt_pdev);
+	first_desc_bad = htt_tx_frag_bank_first_desc_gap_index(pdev->htt_pdev);
+
+	if (ol_tx_id_crossed(old, id, 32))
+		pr_err("HTT TX ID CROSSED: boundary=32 id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+	if (ol_tx_id_crossed(old, id, 56))
+		pr_err("HTT TX ID CROSSED: boundary=56 id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+	if (ol_tx_id_crossed(old, id, 64))
+		pr_err("HTT TX ID CROSSED: boundary=64 id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+	if (ol_tx_id_crossed(old, id, 128))
+		pr_err("HTT TX ID CROSSED: boundary=128 id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+	if (ol_tx_id_crossed(old, id, 256))
+		pr_err("HTT TX ID CROSSED: boundary=256 id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+	if (ol_tx_id_crossed(old, id, first_page_bad))
+		pr_err("HTT TX ID CROSSED: boundary=first_page_bad id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+	if (ol_tx_id_crossed(old, id, first_desc_bad))
+		pr_err("HTT TX ID CROSSED: boundary=first_desc_bad id=%u max=%u first_page_bad=%u first_desc_bad=%u\n",
+		       id, max, first_page_bad, first_desc_bad);
+}
 
 #ifdef QCA_SUPPORT_TXDESC_SANITY_CHECKS
 static inline void ol_tx_desc_sanity_checks(struct ol_txrx_pdev_t *pdev,
@@ -582,6 +635,7 @@ struct ol_tx_desc_t *ol_tx_desc_ll(struct ol_txrx_pdev_t *pdev,
 	tx_desc = ol_tx_desc_alloc_wrapper(pdev, vdev, msdu_info);
 	if (!tx_desc)
 		return NULL;
+	ol_tx_note_desc_id(pdev, tx_desc->id);
 
 	/* initialize the SW tx descriptor */
 	tx_desc->netbuf = netbuf;

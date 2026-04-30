@@ -117,6 +117,23 @@ enum htt_ofdm_datarate {		/* Value    MBPS    Modulation  Coding*/
 	htt_ofdm_datarate_max = 7,
 };
 
+#if defined(HELIUMPLUS)
+uint16_t htt_tx_frag_bank_first_page_gap_index(htt_pdev_handle pdev);
+uint16_t htt_tx_frag_bank_first_desc_gap_index(htt_pdev_handle pdev);
+#else
+static inline uint16_t
+htt_tx_frag_bank_first_page_gap_index(htt_pdev_handle pdev)
+{
+	return 0xffff;
+}
+
+static inline uint16_t
+htt_tx_frag_bank_first_desc_gap_index(htt_pdev_handle pdev)
+{
+	return 0xffff;
+}
+#endif /* defined(HELIUMPLUS) */
+
 /**
  * struct ocb_tx_ctrl_hdr_t - TX control header
  * @version:		must be 1

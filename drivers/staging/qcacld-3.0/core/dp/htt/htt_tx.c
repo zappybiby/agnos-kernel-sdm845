@@ -177,6 +177,22 @@ htt_tx_frag_bank_linear_iova(struct htt_pdev_t *pdev, uint16_t index)
 	       (qdf_dma_addr_t)index * pdev->frag_descs.size;
 }
 
+uint16_t htt_tx_frag_bank_first_page_gap_index(htt_pdev_handle pdev)
+{
+	if (!pdev)
+		return HTT_TX_FRAG_BANK_INVALID_INDEX;
+
+	return pdev->frag_descs.bank_first_page_gap_index;
+}
+
+uint16_t htt_tx_frag_bank_first_desc_gap_index(htt_pdev_handle pdev)
+{
+	if (!pdev)
+		return HTT_TX_FRAG_BANK_INVALID_INDEX;
+
+	return pdev->frag_descs.bank_first_desc_gap_index;
+}
+
 static void htt_tx_frag_bank_check_layout(struct htt_pdev_t *pdev)
 {
 	struct qdf_mem_multi_page_t *pages = &pdev->frag_descs.desc_pages;
