@@ -92,6 +92,12 @@ module_param_named(htt_tx_freelist_start, htt_tx_freelist_start, int, 0600);
 MODULE_PARM_DESC(htt_tx_freelist_start,
 		 "HTT TX freelist start ID: 0 off, -1 first page gap + 8, -2 first descriptor gap + 8, N fixed ID");
 
+void ol_tx_frag_bank_repro_set_freelist_start(int start)
+{
+	WRITE_ONCE(htt_tx_freelist_start, start);
+	pr_err("HTT FRAG BANK BOOT_CMD: freelist_start=%d\n", start);
+}
+
 #define DPT_DEBUGFS_PERMS	(QDF_FILE_USR_READ |	\
 				QDF_FILE_USR_WRITE |	\
 				QDF_FILE_GRP_READ |	\

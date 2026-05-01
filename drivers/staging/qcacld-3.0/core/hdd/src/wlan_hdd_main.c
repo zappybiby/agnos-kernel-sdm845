@@ -100,6 +100,7 @@
 #include "nan_api.h"
 #include <wlan_hdd_napi.h>
 #include "wlan_hdd_disa.h"
+#include <ol_htt_tx_api.h>
 #include "ol_txrx.h"
 #include "cds_utils.h"
 #include "sir_api.h"
@@ -165,6 +166,121 @@ static struct attribute *attrs[] = {
 };
 
 #define MODULE_INITIALIZED 1
+
+#if defined(HELIUMPLUS)
+#define WLAN_BOOT_CMD_MAX 128
+
+static bool wlan_boot_hold_auto = true;
+module_param_named(htt_tx_frag_bank_boot_hold, wlan_boot_hold_auto, bool,
+		   0600);
+MODULE_PARM_DESC(htt_tx_frag_bank_boot_hold,
+		 "Hold plain boot_wlan=1 so HTT frag-bank repro options can be applied before WLAN attach");
+static int wlan_boot_repro_freelist;
+static bool wlan_boot_repro_spacers;
+
+static int wlan_boot_parse_bool(const char *value, bool *enabled)
+{
+	if (!strcmp(value, "1") || !strcmp(value, "y") ||
+	    !strcmp(value, "yes") || !strcmp(value, "true") ||
+	    !strcmp(value, "on")) {
+		*enabled = true;
+		return 0;
+	}
+
+	if (!strcmp(value, "0") || !strcmp(value, "n") ||
+	    !strcmp(value, "no") || !strcmp(value, "false") ||
+	    !strcmp(value, "off")) {
+		*enabled = false;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int wlan_boot_parse_frag_bank_cmd(const char *buf, size_t count,
+					 bool *start)
+{
+	char cmd[WLAN_BOOT_CMD_MAX];
+	char *cursor;
+	char *token;
+	bool set_freelist = false;
+	bool set_spacers = false;
+	bool spacers = false;
+	int freelist = 0;
+	int ret;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+
+	memcpy(cmd, buf, count);
+	cmd[count] = '\0';
+	cursor = strim(cmd);
+
+	if (!*cursor)
+		return -EINVAL;
+
+	*start = false;
+
+	if (wlan_boot_hold_auto && !strcmp(cursor, "1")) {
+		pr_err("HTT FRAG BANK BOOT_CMD: held automatic boot_wlan=1; use \"start\" or \"freelist=-2 spacers=1 start\"\n");
+		return 0;
+	}
+
+	while ((token = strsep(&cursor, " \t\n"))) {
+		if (!*token)
+			continue;
+
+		if (!strcmp(token, "start") || !strcmp(token, "1")) {
+			*start = true;
+			continue;
+		}
+
+		if (!strcmp(token, "clear")) {
+			set_freelist = true;
+			freelist = 0;
+			set_spacers = true;
+			spacers = false;
+			continue;
+		}
+
+		if (!strncmp(token, "freelist=", strlen("freelist="))) {
+			ret = kstrtoint(token + strlen("freelist="), 0,
+					&freelist);
+			if (ret)
+				return ret;
+			set_freelist = true;
+			continue;
+		}
+
+		if (!strncmp(token, "spacers=", strlen("spacers="))) {
+			ret = wlan_boot_parse_bool(token + strlen("spacers="),
+						   &spacers);
+			if (ret)
+				return ret;
+			set_spacers = true;
+			continue;
+		}
+
+		pr_err("HTT FRAG BANK BOOT_CMD: invalid token \"%s\"\n", token);
+		return -EINVAL;
+	}
+
+	if (set_freelist) {
+		wlan_boot_repro_freelist = freelist;
+		ol_tx_frag_bank_repro_set_freelist_start(freelist);
+	}
+	if (set_spacers) {
+		wlan_boot_repro_spacers = spacers;
+		htt_tx_frag_bank_set_spacers(spacers);
+	}
+
+	if (!*start)
+		pr_err("HTT FRAG BANK BOOT_CMD: pending freelist=%d spacers=%u; write \"start\" to initialize WLAN\n",
+		       wlan_boot_repro_freelist, wlan_boot_repro_spacers);
+
+	return 0;
+}
+#endif
 #endif
 
 #define HDD_OPS_INACTIVITY_TIMEOUT (120000)
@@ -12480,12 +12596,31 @@ static ssize_t wlan_boot_cb(struct kobject *kobj,
 			    const char *buf,
 			    size_t count)
 {
+#if defined(HELIUMPLUS)
+	bool start;
+	int ret;
+#endif
+
 	printk("COMMA: wlan_boot_cb");
 
 	if (wlan_loader->loaded_state) {
 		pr_err("%s: wlan driver already initialized\n", __func__);
 		return -EALREADY;
 	}
+
+#if defined(HELIUMPLUS)
+	ret = wlan_boot_parse_frag_bank_cmd(buf, count, &start);
+	if (ret) {
+		pr_err("HTT FRAG BANK BOOT_CMD: parse failed ret=%d\n", ret);
+		return ret;
+	}
+
+	if (!start)
+		return count;
+
+	pr_err("HTT FRAG BANK BOOT_CMD: starting WLAN freelist=%d spacers=%u\n",
+	       wlan_boot_repro_freelist, wlan_boot_repro_spacers);
+#endif
 
 	if (__hdd_module_init()) {
 		pr_err("%s: wlan driver initialization failed\n", __func__);

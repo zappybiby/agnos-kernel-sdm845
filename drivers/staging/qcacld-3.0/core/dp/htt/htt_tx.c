@@ -104,6 +104,12 @@ module_param_named(htt_tx_frag_bank_spacers, htt_tx_frag_bank_spacers, bool,
 MODULE_PARM_DESC(htt_tx_frag_bank_spacers,
 		 "Interleave and release coherent spacer pages during HTT frag-desc allocation");
 
+void htt_tx_frag_bank_set_spacers(bool enabled)
+{
+	WRITE_ONCE(htt_tx_frag_bank_spacers, enabled);
+	pr_err("HTT FRAG BANK BOOT_CMD: spacers=%u\n", enabled);
+}
+
 static uint htt_tx_frag_bank_sample_limit = 64;
 module_param_named(htt_tx_frag_bank_sample_limit,
 		   htt_tx_frag_bank_sample_limit, uint, 0600);
