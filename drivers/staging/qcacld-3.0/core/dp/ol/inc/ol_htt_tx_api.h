@@ -120,6 +120,7 @@ enum htt_ofdm_datarate {		/* Value    MBPS    Modulation  Coding*/
 #if defined(HELIUMPLUS)
 uint16_t htt_tx_frag_bank_first_page_gap_index(htt_pdev_handle pdev);
 uint16_t htt_tx_frag_bank_first_desc_gap_index(htt_pdev_handle pdev);
+void htt_tx_frag_bank_note_publish(htt_pdev_handle pdev, uint16_t msdu_id);
 #else
 static inline uint16_t
 htt_tx_frag_bank_first_page_gap_index(htt_pdev_handle pdev)
@@ -131,6 +132,11 @@ static inline uint16_t
 htt_tx_frag_bank_first_desc_gap_index(htt_pdev_handle pdev)
 {
 	return 0xffff;
+}
+
+static inline void
+htt_tx_frag_bank_note_publish(htt_pdev_handle pdev, uint16_t msdu_id)
+{
 }
 #endif /* defined(HELIUMPLUS) */
 

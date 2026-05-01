@@ -63,6 +63,10 @@
 
 #include "io-pgtable.h"
 
+void __weak htt_tx_frag_bank_smmu_fault_lookup(unsigned long iova, u32 sid)
+{
+}
+
 /* Maximum number of context banks per SMMU */
 #define ARM_SMMU_MAX_CBS		128
 
@@ -1542,6 +1546,7 @@ static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
 			else
 				dev_err(smmu->dev, "hard iova-to-phys (ATOS) failed\n");
 			dev_err(smmu->dev, "SID=0x%x\n", frsynra);
+			htt_tx_frag_bank_smmu_fault_lookup(iova, frsynra);
 		}
 		ret = IRQ_NONE;
 		resume = RESUME_TERMINATE;

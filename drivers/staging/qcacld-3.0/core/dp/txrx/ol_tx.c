@@ -842,10 +842,10 @@ ol_tx_ll_fast(ol_txrx_vdev_handle vdev, qdf_nbuf_t msdu_list,
 					next_seg = NULL;
 				}
 
-				if ((0 == ce_send_fast(pdev->ce_tx_hdl, msdu,
-						ep_id, pkt_download_len))) {
-					struct qdf_tso_info_t *tso_info =
-							&msdu_info.tso_info;
+					if ((0 == ce_send_fast(pdev->ce_tx_hdl, msdu,
+							ep_id, pkt_download_len))) {
+						struct qdf_tso_info_t *tso_info =
+								&msdu_info.tso_info;
 					/*
 					 * If TSO packet, free associated
 					 * remaining TSO segment descriptors
@@ -862,13 +862,17 @@ ol_tx_ll_fast(ol_txrx_vdev_handle vdev, qdf_nbuf_t msdu_list,
 					 * Free the descriptor, return the
 					 * packet to the caller.
 					 */
-					ol_tx_desc_frame_free_nonstd(pdev,
-						tx_desc,
-						htt_tx_status_download_fail);
-					return msdu;
-				}
-				if (msdu_info.tso_info.curr_seg)
-					msdu_info.tso_info.curr_seg = next_seg;
+						ol_tx_desc_frame_free_nonstd(pdev,
+							tx_desc,
+							htt_tx_status_download_fail);
+						return msdu;
+					}
+#if defined(HELIUMPLUS)
+					htt_tx_frag_bank_note_publish(pdev->htt_pdev,
+								      tx_desc->id);
+#endif
+					if (msdu_info.tso_info.curr_seg)
+						msdu_info.tso_info.curr_seg = next_seg;
 
 
 				if (msdu_info.tso_info.is_tso) {
@@ -974,18 +978,22 @@ ol_tx_ll_fast(ol_txrx_vdev_handle vdev, qdf_nbuf_t msdu_list,
 			 * pointer before the ce_send call.
 			 */
 			next = qdf_nbuf_next(msdu);
-			if ((0 == ce_send_fast(pdev->ce_tx_hdl, msdu,
-					       ep_id, pkt_download_len))) {
-				/*
-				 * The packet could not be sent
+				if ((0 == ce_send_fast(pdev->ce_tx_hdl, msdu,
+						       ep_id, pkt_download_len))) {
+					/*
+					 * The packet could not be sent
 				 * Free the descriptor, return the packet to the
 				 * caller
 				 */
-				ol_tx_desc_free(pdev, tx_desc);
-				return msdu;
-			}
-			msdu = next;
-		} else {
+					ol_tx_desc_free(pdev, tx_desc);
+					return msdu;
+				}
+#if defined(HELIUMPLUS)
+				htt_tx_frag_bank_note_publish(pdev->htt_pdev,
+							      tx_desc->id);
+#endif
+				msdu = next;
+			} else {
 			TXRX_STATS_MSDU_LIST_INCR(
 				pdev, tx.dropped.host_reject, msdu);
 			return msdu; /* the list of unaccepted MSDUs */

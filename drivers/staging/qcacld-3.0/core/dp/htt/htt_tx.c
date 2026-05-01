@@ -32,7 +32,11 @@
 #include <qdf_mem.h>         /* qdf_mem_alloc_consistent et al */
 #include <qdf_nbuf.h>           /* qdf_nbuf_t, etc. */
 #include <qdf_time.h>           /* qdf_mdelay */
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
 
 #include <htt.h>                /* htt_tx_msdu_desc_t */
 #include <htc.h>                /* HTC_HDR_LENGTH */
@@ -90,12 +94,109 @@ static qdf_dma_addr_t htt_tx_get_paddr(htt_pdev_handle pdev,
 #ifdef HELIUMPLUS
 
 #define HTT_TX_FRAG_BANK_INVALID_INDEX 0xffff
+#define HTT_TX_FRAG_BANK_RECENT_SAMPLES 128
+#define HTT_TX_FRAG_BANK_FAULT_MATCHES 4
+#define HTT_TX_FRAG_BANK_BURST_SIZE 128
 
 static bool htt_tx_frag_bank_spacers;
 module_param_named(htt_tx_frag_bank_spacers, htt_tx_frag_bank_spacers, bool,
 		   0600);
 MODULE_PARM_DESC(htt_tx_frag_bank_spacers,
 		 "Interleave and release coherent spacer pages during HTT frag-desc allocation");
+
+static uint htt_tx_frag_bank_sample_limit = 64;
+module_param_named(htt_tx_frag_bank_sample_limit,
+		   htt_tx_frag_bank_sample_limit, uint, 0600);
+MODULE_PARM_DESC(htt_tx_frag_bank_sample_limit,
+		 "Number of compact firmware-linear shadow samples to print");
+
+struct htt_tx_frag_bank_recent_sample {
+	bool valid;
+	u32 seq;
+	unsigned long jiffies;
+	uint16_t msdu_id;
+	uint8_t frag_idx;
+	uint16_t len;
+	uint16_t linear_page;
+	uint32_t linear_off;
+	qdf_dma_addr_t frag_iova;
+	qdf_dma_addr_t host_iova;
+	qdf_dma_addr_t linear_iova;
+	const char *linear_class;
+};
+
+static DEFINE_SPINLOCK(htt_tx_frag_bank_recent_lock);
+static struct htt_tx_frag_bank_recent_sample
+	htt_tx_frag_bank_recent[HTT_TX_FRAG_BANK_RECENT_SAMPLES];
+static u32 htt_tx_frag_bank_recent_head;
+static u32 htt_tx_frag_bank_sample_seq;
+static u32 htt_tx_frag_bank_sample_printed;
+
+static void htt_tx_frag_bank_shadow_reset(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&htt_tx_frag_bank_recent_lock, flags);
+	memset(htt_tx_frag_bank_recent, 0, sizeof(htt_tx_frag_bank_recent));
+	htt_tx_frag_bank_recent_head = 0;
+	htt_tx_frag_bank_sample_seq = 0;
+	htt_tx_frag_bank_sample_printed = 0;
+	spin_unlock_irqrestore(&htt_tx_frag_bank_recent_lock, flags);
+}
+
+static bool htt_tx_frag_bank_take_sample_print(void)
+{
+	unsigned long flags;
+	bool take = false;
+
+	if (!htt_tx_frag_bank_sample_limit)
+		return false;
+
+	spin_lock_irqsave(&htt_tx_frag_bank_recent_lock, flags);
+	if (htt_tx_frag_bank_sample_printed < htt_tx_frag_bank_sample_limit) {
+		htt_tx_frag_bank_sample_printed++;
+		take = true;
+	}
+	spin_unlock_irqrestore(&htt_tx_frag_bank_recent_lock, flags);
+
+	return take;
+}
+
+static u32
+htt_tx_frag_bank_record_recent(uint16_t msdu_id, uint8_t frag_idx,
+			       qdf_dma_addr_t frag_iova, uint16_t len,
+			       qdf_dma_addr_t host_iova,
+			       qdf_dma_addr_t linear_iova,
+			       uint16_t linear_page,
+			       uint32_t linear_off,
+			       const char *linear_class)
+{
+	struct htt_tx_frag_bank_recent_sample *sample;
+	unsigned long flags;
+	u32 seq;
+
+	spin_lock_irqsave(&htt_tx_frag_bank_recent_lock, flags);
+	seq = ++htt_tx_frag_bank_sample_seq;
+	sample = &htt_tx_frag_bank_recent[htt_tx_frag_bank_recent_head %
+					  HTT_TX_FRAG_BANK_RECENT_SAMPLES];
+	htt_tx_frag_bank_recent_head++;
+	memset(sample, 0, sizeof(*sample));
+	sample->valid = true;
+	sample->seq = seq;
+	sample->jiffies = jiffies;
+	sample->msdu_id = msdu_id;
+	sample->frag_idx = frag_idx;
+	sample->len = len;
+	sample->linear_page = linear_page;
+	sample->linear_off = linear_off;
+	sample->frag_iova = frag_iova;
+	sample->host_iova = host_iova;
+	sample->linear_iova = linear_iova;
+	sample->linear_class = linear_class ? linear_class : "unknown";
+	spin_unlock_irqrestore(&htt_tx_frag_bank_recent_lock, flags);
+
+	return seq;
+}
 
 /**
  * htt_tx_desc_get_size() - get tx descripotrs size
@@ -184,6 +285,413 @@ htt_tx_frag_bank_linear_iova(struct htt_pdev_t *pdev, uint16_t index)
 	       (qdf_dma_addr_t)index * pdev->frag_descs.size;
 }
 
+static struct msdu_ext_desc_t *
+htt_tx_frag_bank_host_desc(struct htt_pdev_t *pdev, uint16_t index)
+{
+	struct qdf_mem_multi_page_t *pages = &pdev->frag_descs.desc_pages;
+	struct qdf_mem_dma_page_t *dma_page;
+	uint16_t elems_per_page;
+	uint16_t target_page;
+	uint16_t offset;
+
+	elems_per_page = pages->num_element_per_page;
+	if (!elems_per_page || !pages->dma_pages)
+		return NULL;
+
+	target_page = index / elems_per_page;
+	if (target_page >= pages->num_pages)
+		return NULL;
+
+	offset = index % elems_per_page;
+	dma_page = &pages->dma_pages[target_page];
+
+	return (struct msdu_ext_desc_t *)(dma_page->page_v_addr_start +
+		offset * pdev->frag_descs.size);
+}
+
+static const char *
+htt_tx_frag_bank_linear_desc(struct htt_pdev_t *pdev,
+			     qdf_dma_addr_t linear_iova,
+			     qdf_dma_addr_t host_iova,
+			     struct msdu_ext_desc_t **desc,
+			     uint16_t *page_idx, uint32_t *page_offset,
+			     bool *full_desc)
+{
+	struct qdf_mem_multi_page_t *pages = &pdev->frag_descs.desc_pages;
+	uint32_t used_bytes;
+	uint16_t page;
+
+	*desc = NULL;
+	*page_idx = HTT_TX_FRAG_BANK_INVALID_INDEX;
+	*page_offset = 0;
+	*full_desc = false;
+
+	if (!pages->dma_pages || !pages->num_pages ||
+	    !pages->num_element_per_page)
+		return "no_frag_pages";
+
+	used_bytes = pages->num_element_per_page * pdev->frag_descs.size;
+
+	for (page = 0; page < pages->num_pages; page++) {
+		struct qdf_mem_dma_page_t *dma_page = &pages->dma_pages[page];
+		qdf_dma_addr_t start = dma_page->page_p_addr;
+		qdf_dma_addr_t end = start + PAGE_SIZE;
+		uint32_t offset;
+
+		if (linear_iova < start || linear_iova >= end)
+			continue;
+
+		offset = (uint32_t)(linear_iova - start);
+		*page_idx = page;
+		*page_offset = offset;
+		if (offset + sizeof(struct msdu_ext_desc_t) <= PAGE_SIZE) {
+			*full_desc = true;
+			*desc = (struct msdu_ext_desc_t *)
+				(dma_page->page_v_addr_start + offset);
+		}
+
+		if (linear_iova == host_iova)
+			return "host_desc";
+		if (offset >= used_bytes)
+			return "page_slack";
+		if (!*full_desc)
+			return "crosses_page";
+		return "known_frag_page";
+	}
+
+	return "outside_known_frag_pages";
+}
+
+static qdf_dma_addr_t
+htt_tx_frag_bank_frag_paddr(const struct msdu_ext_frag_desc *frag)
+{
+	return ((qdf_dma_addr_t)frag->u.frag32.ptr_hi << 32) |
+	       frag->u.frag32.ptr_low;
+}
+
+static const char *
+htt_tx_frag_bank_iova_map(struct htt_pdev_t *pdev, qdf_dma_addr_t iova,
+			  qdf_dma_addr_t *phys)
+{
+#ifdef CONFIG_ARM_SMMU
+	struct dma_iommu_mapping *mapping;
+#endif
+
+	*phys = 0;
+
+	if (!iova)
+		return "zero";
+	if (!pdev->osdev || !qdf_mem_smmu_s1_enabled(pdev->osdev))
+		return "smmu_off";
+
+#ifdef CONFIG_ARM_SMMU
+	mapping = pld_smmu_get_mapping(pdev->osdev->dev);
+	if (!mapping)
+		return "no_mapping";
+
+	*phys = iommu_iova_to_phys(mapping->domain, iova);
+	if (!*phys)
+		return "unmapped";
+
+	return "mapped";
+#else
+	return "no_arm_smmu";
+#endif
+}
+
+static void
+htt_tx_frag_bank_dump_desc(const char *tag, uint16_t msdu_id,
+			   const struct msdu_ext_desc_t *desc)
+{
+	const uint32_t *words = (const uint32_t *)&desc->tso_flags;
+
+	pr_err("HTT FRAG BANK SHADOW_%s: msdu_id=%u tso=%08x,%08x,%08x,%08x,%08x,%08x frag0=0x%llx/%u frag1=0x%llx/%u frag2=0x%llx/%u frag3=0x%llx/%u frag4=0x%llx/%u frag5=0x%llx/%u\n",
+	       tag, (unsigned int)msdu_id, words[0], words[1], words[2],
+	       words[3], words[4], words[5],
+	       (unsigned long long)htt_tx_frag_bank_frag_paddr(&desc->frags[0]),
+	       (unsigned int)desc->frags[0].u.frag32.len,
+	       (unsigned long long)htt_tx_frag_bank_frag_paddr(&desc->frags[1]),
+	       (unsigned int)desc->frags[1].u.frag32.len,
+	       (unsigned long long)htt_tx_frag_bank_frag_paddr(&desc->frags[2]),
+	       (unsigned int)desc->frags[2].u.frag32.len,
+	       (unsigned long long)htt_tx_frag_bank_frag_paddr(&desc->frags[3]),
+	       (unsigned int)desc->frags[3].u.frag32.len,
+	       (unsigned long long)htt_tx_frag_bank_frag_paddr(&desc->frags[4]),
+	       (unsigned int)desc->frags[4].u.frag32.len,
+	       (unsigned long long)htt_tx_frag_bank_frag_paddr(&desc->frags[5]),
+	       (unsigned int)desc->frags[5].u.frag32.len);
+}
+
+static void
+htt_tx_frag_bank_dump_linear_maps(struct htt_pdev_t *pdev, uint16_t msdu_id,
+				  const struct msdu_ext_desc_t *desc)
+{
+	const char *map0, *map1, *map2, *map3, *map4, *map5;
+	qdf_dma_addr_t iova0, iova1, iova2, iova3, iova4, iova5;
+	qdf_dma_addr_t phys0, phys1, phys2, phys3, phys4, phys5;
+
+	iova0 = htt_tx_frag_bank_frag_paddr(&desc->frags[0]);
+	iova1 = htt_tx_frag_bank_frag_paddr(&desc->frags[1]);
+	iova2 = htt_tx_frag_bank_frag_paddr(&desc->frags[2]);
+	iova3 = htt_tx_frag_bank_frag_paddr(&desc->frags[3]);
+	iova4 = htt_tx_frag_bank_frag_paddr(&desc->frags[4]);
+	iova5 = htt_tx_frag_bank_frag_paddr(&desc->frags[5]);
+
+	map0 = htt_tx_frag_bank_iova_map(pdev, iova0, &phys0);
+	map1 = htt_tx_frag_bank_iova_map(pdev, iova1, &phys1);
+	map2 = htt_tx_frag_bank_iova_map(pdev, iova2, &phys2);
+	map3 = htt_tx_frag_bank_iova_map(pdev, iova3, &phys3);
+	map4 = htt_tx_frag_bank_iova_map(pdev, iova4, &phys4);
+	map5 = htt_tx_frag_bank_iova_map(pdev, iova5, &phys5);
+
+	pr_err("HTT FRAG BANK SHADOW_LINEAR_MAP: msdu_id=%u frag0=%s/0x%llx frag1=%s/0x%llx frag2=%s/0x%llx frag3=%s/0x%llx frag4=%s/0x%llx frag5=%s/0x%llx\n",
+	       (unsigned int)msdu_id,
+	       map0, (unsigned long long)phys0,
+	       map1, (unsigned long long)phys1,
+	       map2, (unsigned long long)phys2,
+	       map3, (unsigned long long)phys3,
+	       map4, (unsigned long long)phys4,
+	       map5, (unsigned long long)phys5);
+}
+
+static void
+htt_tx_frag_bank_shadow_sample(struct htt_pdev_t *pdev, uint16_t msdu_id,
+			       qdf_dma_addr_t host_iova,
+			       qdf_dma_addr_t linear_iova)
+{
+	struct msdu_ext_desc_t *host_desc;
+	struct msdu_ext_desc_t *linear_desc;
+	const char *linear_class;
+	const char *first_map = "none";
+	qdf_dma_addr_t first_iova = 0;
+	qdf_dma_addr_t first_phys = 0;
+	qdf_dma_addr_t host0_iova = 0;
+	uint16_t host0_len = 0;
+	uint16_t first_len = 0;
+	uint16_t page_idx;
+	uint32_t page_offset;
+	uint32_t linear_nonzero = 0;
+	uint32_t linear_unmapped = 0;
+	u32 last_seq = 0;
+	bool full_desc;
+	bool print_sample;
+	int frag_idx;
+
+	if (pdev->frag_descs.size != sizeof(struct msdu_ext_desc_t))
+		return;
+
+	print_sample = htt_tx_frag_bank_take_sample_print();
+	host_desc = htt_tx_frag_bank_host_desc(pdev, msdu_id);
+	linear_class = htt_tx_frag_bank_linear_desc(pdev, linear_iova,
+						    host_iova, &linear_desc,
+						    &page_idx, &page_offset,
+						    &full_desc);
+
+	if (host_desc) {
+		host0_iova = htt_tx_frag_bank_frag_paddr(&host_desc->frags[0]);
+		host0_len = host_desc->frags[0].u.frag32.len;
+	}
+
+	if (linear_desc) {
+		for (frag_idx = 0; frag_idx < ARRAY_SIZE(linear_desc->frags);
+		     frag_idx++) {
+			const struct msdu_ext_frag_desc *frag;
+			qdf_dma_addr_t frag_iova;
+			uint16_t frag_len;
+
+			frag = &linear_desc->frags[frag_idx];
+			frag_iova = htt_tx_frag_bank_frag_paddr(frag);
+			frag_len = frag->u.frag32.len;
+			if (!frag_iova || !frag_len)
+				continue;
+
+			linear_nonzero++;
+			last_seq = htt_tx_frag_bank_record_recent(msdu_id,
+				frag_idx, frag_iova, frag_len, host_iova,
+				linear_iova, page_idx, page_offset,
+				linear_class);
+
+			if (print_sample) {
+				const char *map;
+				qdf_dma_addr_t phys;
+
+				map = htt_tx_frag_bank_iova_map(pdev,
+								frag_iova,
+								&phys);
+				if (!strcmp(map, "unmapped"))
+					linear_unmapped++;
+				if (!first_iova) {
+					first_iova = frag_iova;
+					first_len = frag_len;
+					first_map = map;
+					first_phys = phys;
+				}
+			}
+		}
+	}
+
+	if (print_sample)
+		pr_err("HTT FRAG BANK SHADOW_SAMPLE: seq=%u msdu_id=%u class=%s host_iova=0x%llx linear_iova=0x%llx linear_page=%u linear_off=0x%x full_desc=%u linear_nonzero=%u linear_unmapped=%u first_iova=0x%llx first_len=%u first_map=%s first_phys=0x%llx host0=0x%llx/%u\n",
+		       last_seq, (unsigned int)msdu_id, linear_class,
+		       (unsigned long long)host_iova,
+		       (unsigned long long)linear_iova,
+		       (unsigned int)page_idx, (unsigned int)page_offset,
+		       (unsigned int)full_desc, linear_nonzero,
+		       linear_unmapped, (unsigned long long)first_iova,
+		       (unsigned int)first_len, first_map,
+		       (unsigned long long)first_phys,
+		       (unsigned long long)host0_iova,
+		       (unsigned int)host0_len);
+}
+
+static bool
+htt_tx_frag_bank_iova_in_range(qdf_dma_addr_t iova, qdf_dma_addr_t start,
+			       qdf_dma_addr_t len)
+{
+	qdf_dma_addr_t end = start + len;
+
+	return len && end > start && iova >= start && iova < end;
+}
+
+static const char *
+htt_tx_frag_bank_fault_match_mode(qdf_dma_addr_t far,
+				  const struct htt_tx_frag_bank_recent_sample
+				  *sample)
+{
+	qdf_dma_addr_t end;
+	qdf_dma_addr_t burst_start;
+	qdf_dma_addr_t burst_end;
+
+	if (!sample->valid || !sample->frag_iova || !sample->len)
+		return NULL;
+	if (far == sample->frag_iova)
+		return "exact";
+	if (htt_tx_frag_bank_iova_in_range(far, sample->frag_iova,
+					   sample->len))
+		return "range";
+
+	end = sample->frag_iova + sample->len;
+	if (end <= sample->frag_iova)
+		return NULL;
+
+	burst_start = sample->frag_iova &
+		~(qdf_dma_addr_t)(HTT_TX_FRAG_BANK_BURST_SIZE - 1);
+	burst_end = (end + HTT_TX_FRAG_BANK_BURST_SIZE - 1) &
+		~(qdf_dma_addr_t)(HTT_TX_FRAG_BANK_BURST_SIZE - 1);
+	if (burst_end > burst_start && far >= burst_start && far < burst_end)
+		return "burst";
+
+	return NULL;
+}
+
+void htt_tx_frag_bank_smmu_fault_lookup(unsigned long iova, u32 sid)
+{
+	struct htt_tx_frag_bank_recent_sample
+		matches[HTT_TX_FRAG_BANK_FAULT_MATCHES];
+	const char *modes[HTT_TX_FRAG_BANK_FAULT_MATCHES];
+	qdf_dma_addr_t far = (qdf_dma_addr_t)iova;
+	unsigned long flags;
+	u32 head;
+	u32 recent_seq;
+	int match_count = 0;
+	int idx;
+
+	if (sid != 0x40)
+		return;
+
+	spin_lock_irqsave(&htt_tx_frag_bank_recent_lock, flags);
+	head = htt_tx_frag_bank_recent_head;
+	recent_seq = htt_tx_frag_bank_sample_seq;
+	for (idx = 0; idx < HTT_TX_FRAG_BANK_RECENT_SAMPLES &&
+	     match_count < HTT_TX_FRAG_BANK_FAULT_MATCHES; idx++) {
+		struct htt_tx_frag_bank_recent_sample *sample;
+		const char *mode;
+		u32 pos;
+
+		pos = (head + HTT_TX_FRAG_BANK_RECENT_SAMPLES - 1 - idx) %
+			HTT_TX_FRAG_BANK_RECENT_SAMPLES;
+		sample = &htt_tx_frag_bank_recent[pos];
+		mode = htt_tx_frag_bank_fault_match_mode(far, sample);
+		if (!mode)
+			continue;
+
+		matches[match_count] = *sample;
+		modes[match_count] = mode;
+		match_count++;
+	}
+	spin_unlock_irqrestore(&htt_tx_frag_bank_recent_lock, flags);
+
+	if (!match_count) {
+		pr_err("HTT FRAG BANK SMMU_MATCH: far=0x%llx sid=0x%x matches=0 recent_seq=%u\n",
+		       (unsigned long long)far, sid, recent_seq);
+		return;
+	}
+
+	for (idx = 0; idx < match_count; idx++) {
+		unsigned long age_ms;
+
+		age_ms = jiffies_to_msecs(jiffies - matches[idx].jiffies);
+		pr_err("HTT FRAG BANK SMMU_MATCH: far=0x%llx sid=0x%x seq=%u msdu_id=%u frag=%u mode=%s frag_iova=0x%llx len=%u age_ms=%lu host_iova=0x%llx linear_iova=0x%llx class=%s linear_page=%u linear_off=0x%x\n",
+		       (unsigned long long)far, sid, matches[idx].seq,
+		       (unsigned int)matches[idx].msdu_id,
+		       (unsigned int)matches[idx].frag_idx, modes[idx],
+		       (unsigned long long)matches[idx].frag_iova,
+		       (unsigned int)matches[idx].len, age_ms,
+		       (unsigned long long)matches[idx].host_iova,
+		       (unsigned long long)matches[idx].linear_iova,
+		       matches[idx].linear_class,
+		       (unsigned int)matches[idx].linear_page,
+		       (unsigned int)matches[idx].linear_off);
+	}
+}
+
+static void
+htt_tx_frag_bank_shadow_decode(struct htt_pdev_t *pdev, uint16_t msdu_id,
+			       qdf_dma_addr_t host_iova,
+			       qdf_dma_addr_t linear_iova)
+{
+	struct msdu_ext_desc_t *host_desc;
+	struct msdu_ext_desc_t *linear_desc;
+	const char *linear_class;
+	uint16_t page_idx;
+	uint32_t page_offset;
+	bool full_desc;
+
+	if (pdev->frag_descs.size != sizeof(struct msdu_ext_desc_t)) {
+		pr_err("HTT FRAG BANK SHADOW: msdu_id=%u unsupported_desc_size=%u\n",
+		       (unsigned int)msdu_id,
+		       (unsigned int)pdev->frag_descs.size);
+		return;
+	}
+
+	host_desc = htt_tx_frag_bank_host_desc(pdev, msdu_id);
+	linear_class = htt_tx_frag_bank_linear_desc(pdev, linear_iova,
+						    host_iova, &linear_desc,
+						    &page_idx, &page_offset,
+						    &full_desc);
+
+	pr_err("HTT FRAG BANK SHADOW: msdu_id=%u host_iova=0x%llx linear_iova=0x%llx class=%s linear_page=%u linear_off=0x%x full_desc=%u\n",
+	       (unsigned int)msdu_id, (unsigned long long)host_iova,
+	       (unsigned long long)linear_iova, linear_class,
+	       (unsigned int)page_idx, (unsigned int)page_offset,
+	       (unsigned int)full_desc);
+
+	if (host_desc)
+		htt_tx_frag_bank_dump_desc("HOST", msdu_id, host_desc);
+	else
+		pr_err("HTT FRAG BANK SHADOW_HOST: msdu_id=%u unreadable\n",
+		       (unsigned int)msdu_id);
+
+	if (linear_desc)
+		htt_tx_frag_bank_dump_desc("LINEAR", msdu_id, linear_desc);
+	else
+		pr_err("HTT FRAG BANK SHADOW_LINEAR: msdu_id=%u unreadable\n",
+		       (unsigned int)msdu_id);
+
+	if (linear_desc)
+		htt_tx_frag_bank_dump_linear_maps(pdev, msdu_id, linear_desc);
+}
+
 uint16_t htt_tx_frag_bank_first_page_gap_index(htt_pdev_handle pdev)
 {
 	if (!pdev)
@@ -220,6 +728,7 @@ static void htt_tx_frag_bank_check_layout(struct htt_pdev_t *pdev)
 	pdev->frag_descs.bank_has_desc_gap = false;
 	pdev->frag_descs.bank_page_gap_reported = false;
 	pdev->frag_descs.bank_desc_gap_reported = false;
+	htt_tx_frag_bank_shadow_reset();
 
 	if (!pages->dma_pages || !pages->num_pages ||
 	    !pages->num_element_per_page || !pdev->frag_descs.size)
@@ -280,9 +789,10 @@ static void htt_tx_frag_bank_check_layout(struct htt_pdev_t *pdev)
 	       (unsigned int)pdev->frag_descs.bank_first_desc_gap_index);
 }
 
-static void
-htt_tx_frag_bank_note_publish(struct htt_pdev_t *pdev, uint16_t msdu_id)
+void
+htt_tx_frag_bank_note_publish(htt_pdev_handle pdev_handle, uint16_t msdu_id)
 {
+	struct htt_pdev_t *pdev = (struct htt_pdev_t *)pdev_handle;
 	qdf_dma_addr_t host_iova;
 	qdf_dma_addr_t linear_iova;
 	uint16_t old_max;
@@ -325,7 +835,14 @@ htt_tx_frag_bank_note_publish(struct htt_pdev_t *pdev, uint16_t msdu_id)
 		       (unsigned int)pdev->frag_descs.bank_first_desc_gap_index,
 		       (unsigned long long)host_iova,
 		       (unsigned long long)linear_iova);
+		htt_tx_frag_bank_shadow_decode(pdev, msdu_id, host_iova,
+					       linear_iova);
 	}
+
+	if (pdev->frag_descs.bank_has_desc_gap &&
+	    msdu_id >= pdev->frag_descs.bank_first_desc_gap_index)
+		htt_tx_frag_bank_shadow_sample(pdev, msdu_id, host_iova,
+					       linear_iova);
 }
 
 static void
